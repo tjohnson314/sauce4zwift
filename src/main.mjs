@@ -685,7 +685,7 @@ export async function main({logEmitter, logFile, logQueue, sentryAnonId,
             }
         };
     }
-    const isSauceProtoHandler = Electron.app.setAsDefaultProtocolClient(sauceScheme);
+    const isSauceProtoHandler = !isDEV && Electron.app.setAsDefaultProtocolClient(sauceScheme);
     if (!isSauceProtoHandler) {
         if (OS.platform() !== 'linux') {
             console.error("Unable to register as protocol handler for:", sauceScheme);
@@ -707,8 +707,12 @@ export async function main({logEmitter, logFile, logQueue, sentryAnonId,
         });
     }
     try {
-        if (!await Windows.eulaConsent() ||
-            !await Windows.patronLink({sauceApp, requireLegacy: !isSauceProtoHandler})) {
+        if (!await Windows.eulaConsent()) {
+            console.error('EULA not accepted.');
+            await maybeUpdateAndRestart();
+            return quit();
+        }
+        if (!isDEV && !await Windows.patronLink({sauceApp, requireLegacy: !isSauceProtoHandler})) {
             console.error('Activation failed or aborted by user.');
             await maybeUpdateAndRestart();
             return quit();

@@ -269,6 +269,7 @@ export class SauceApp extends EventEmitter {
             'getEventSubgroupEntrants', 'getEventSubgroupResults', 'addEventSubgroupSignup',
             'deleteEventSignup', 'loadOlderEvents', 'loadNewerEvents', 'resetAthletesDB',
             'getChatHistory', 'setFollowing', 'setNotFollowing', 'giveRideon', 'getPowerProfile',
+            'getPlayerProfile',
             'getPlayerState', 'getNearbyData', 'getGroupsData', 'getAthleteData', 'getAthletesData',
             'updateAthleteData', 'getAthleteLaps', 'getAthleteSegments', 'getAthleteEvents',
             'getAthleteStreams', 'getSegmentResults', 'putState', 'fileReplayLoad', 'fileReplayPlay',
