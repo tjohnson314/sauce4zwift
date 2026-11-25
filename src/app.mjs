@@ -19,15 +19,42 @@ const require = createRequire(import.meta.url);
 const pkg = require('../package.json');
 
 
-function getLocalRoutedIP() {
+async function getLocalRoutedIP() {
+    const aborter = new AbortController();
+    const signal = aborter.signal;
+    let addr;
     const s = Dgram.createSocket('udp4');
-    const p = new Promise((resolve, reject) => {
-        s.once('connect', () => resolve(s.address().address));
-        s.once('error', reject);
-        s.connect(53, '1.1.1.1');
-    });
-    p.finally(() => s.close());
-    return p;
+    try {
+        addr = await new Promise((resolve, reject) => {
+            s.on('connect', () => resolve(s.address().address), {signal});
+            s.on('error', reject, {signal});
+            s.connect(53, '1.1.1.1');
+        });
+    } finally {
+        aborter.abort();
+        s.close();
+    }
+    // Verify interface has a non-zero broadcast mask (i.e. not peer-to-peer / vpn)
+    try {
+        const ifaces = Object.values(OS.networkInterfaces())
+            .flat()
+            .filter(x => !x.internal && x.family !== 'IPv6');
+        const iface = ifaces.find(x => x.address === addr);
+        if (iface && iface.netmask === '255.255.255.255') {
+            const prospects = ifaces
+                .filter(x => x.netmask !== '255.255.255.255')
+                .toSorted((a, b) => (b.mac !== '00:00:00:00:00:00') - (a.mac !== '00:00:00:00:00:00'))
+                .toSorted((a, b) => b.address.startsWith('192.168') - a.address.startsWith('192.168'));
+            const fallback = prospects[0]?.address;
+            if (fallback) {
+                console.warn(`Ignoring VPN or peer-to-peer address (${addr}), instead using:`, fallback);
+                return fallback;
+            }
+        }
+    } catch(e) {
+        console.warn("Failed to determine if IP address is PtP", e);
+    }
+    return addr;
 }
 
 
@@ -81,10 +108,12 @@ export class SauceApp extends EventEmitter {
     _metricsPromise;
     _lastMetricsTS = 0;
 
-    constructor({appPath, buildEnv={}}) {
+    constructor({appPath, logPath, isDEV, buildEnv={}}) {
         super();
         this.rpcEventEmitters = new RPC.RPCEventEmitters();
         this.appPath = appPath;
+        this.logPath = logPath;
+        this.isDEV = isDEV;
         this.buildEnv = buildEnv;
         this.zwiftAPI = undefined;
         this.zwiftMonitorAPI = undefined;
@@ -211,7 +240,7 @@ export class SauceApp extends EventEmitter {
             'reverse', 'toggleGraphs', 'turnLeft', 'turnRight', 'goStraight',
             'coffeeStop', 'discardPowerUp', 'teleportToAthlete', 'takeVideo', 'getUserActions',
             'runUserAction', 'expandUserAction', 'collapseUserAction', 'setCamera',
-            'getGameSessionInfo'];
+            'getGameSessionInfo', 'getWorkoutStatus'];
         for (const x of rpcs) {
             RPC.register(gcs[x].bind(gcs), {name: x});
         }
@@ -244,6 +273,7 @@ export class SauceApp extends EventEmitter {
             selfAthleteId: options.athleteId || this.zwiftAPI.profile.id,
             randomWatch: options.randomWatch,
             exclusions: options.exclusions,
+            logPath: this.isDEV ? this.logPath : undefined,
         }) : undefined;
         let ip;
         if (this.getSetting('gameConnectionEnabled') && !options.disableGameConnection) {
@@ -276,7 +306,8 @@ export class SauceApp extends EventEmitter {
             'fileReplayStop', 'fileReplayRewind', 'fileReplayForward', 'fileReplayStatus',
             'getIRLMapTile', 'getWorkouts', 'getWorkout', 'getWorkoutCollection',
             'getWorkoutCollections', 'getWorkoutSchedule', 'getZwiftConnectionInfo', 'reconnectZwift',
-            'toggleMarkedAthlete', 'removeFollower', 'getGameState',
+            'toggleMarkedAthlete', 'removeFollower', 'getGameState', 'getOnlinePacerBots',
+            'getOnlineFollowingAthletes',
             'getAthleteStats' /* DEPRECATED */, 'updateAthleteStats' /* DEPRECATED */,
             'getQueue' /* XXX ambiguous name */
         ];
@@ -363,4 +394,12 @@ export async function getExclusions(appPath) {
         throw new Error("tampering detected");
     }
     return new Set(data.map(x => x.idhash));
+}
+
+
+export function assertValidExternalLink(url) {
+    const schemes = /^(https?|mailto):/;
+    if (!schemes.test(url)) {
+        throw new Error('Invalid Link');
+    }
 }

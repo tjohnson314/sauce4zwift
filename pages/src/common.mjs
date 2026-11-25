@@ -1,4 +1,4 @@
-/* global Sentry, electron */
+/* global electron */
 import {sleep as _sleep} from '../../shared/sauce/base.mjs';
 import * as Time from '../../shared/sauce/time.mjs';
 import * as Locale from '../../shared/sauce/locale.mjs';
@@ -17,6 +17,7 @@ let windowID;
 let subscribeImpl;
 let unsubscribeImpl;
 let schedStorageFlush;
+let drainEarlySentryBreadcrumbs;
 
 export const attributions = {
     tp: 'Training Stress Score®, TSS®, Normalized Power®, NP®, Intensity Factor® and IF® are ' +
@@ -126,8 +127,25 @@ class LocalStorage extends EventTarget {
 }
 
 
-function b64urlEncode(data) {
-    return btoa(data).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+let b64urlEncode;
+if (Uint8Array.prototype.toBase64) {
+    const _te = new TextEncoder();
+    const _teBuf = new Uint8Array(0x10000);
+    b64urlEncode = data => {
+        let buf = _teBuf;
+        let {read, written} = _te.encodeInto(data, buf);
+        if (read < data.length) {
+            buf = _te.encode(data);
+            written = buf.byteLength;
+        }
+        return buf.subarray(0, written).toBase64({alphabet: 'base64url', omitPadding: true});
+    };
+} else {
+    b64urlEncode = data =>
+        btoa(unescape(encodeURIComponent(data)))
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
 }
 
 
@@ -136,8 +154,19 @@ if (window.isElectron) {
     doc.classList.add('electron-mode');
     doc.classList.toggle('frame', !!electron.context.frame);
     doc.dataset.platform = electron.context.platform;
-
     windowID = electron.context.id;
+    if (electron.context.errorReporting) {
+        const cleanup = new AbortController();
+        const earlyBreadcrumbs = [];
+        drainEarlySentryBreadcrumbs = () => {
+            cleanup.abort();
+            const crumbs =  earlyBreadcrumbs.slice();
+            earlyBreadcrumbs.length = 0;
+            return crumbs;
+        };
+        document.addEventListener('sentry-breadcrumb', ev => earlyBreadcrumbs.push(ev.detail),
+                                  {signal: cleanup.signal});
+    }
     const subs = [];
     const pendingPorts = new Map();
     addEventListener('message', ev => {
@@ -606,7 +635,10 @@ export async function computeRoutePath(route, options={}) {
                 section.roadCurvePath.toReversed() :
                 section.roadCurvePath);
             for (let j = 0; j < section.roadCurvePath.nodes.length; j++) {
-                curvePath.nodes[nodesOfft + j].index = sectionIndex;
+                curvePath.nodes[nodesOfft + j] = Object.freeze({
+                    ...curvePath.nodes[nodesOfft + j],
+                    index: sectionIndex
+                });
             }
         }
     }
@@ -1356,18 +1388,25 @@ export async function initNationFlags() {
 }
 
 
+const _eventBadgeHues = new Map(Object.entries({
+    A: '0deg',
+    B: '90deg',
+    C: '180deg',
+    D: '60deg',
+    E: '260deg',
+}));
+
 export function eventBadge(label) {
     if (!label) {
         return '';
     }
-    const hue = {
-        A: 0,
-        B: 90,
-        C: 180,
-        D: 60,
-        E: 260,
-    }[label];
-    return `<span class="badge category" style="--hue: ${hue}deg;">${label}</span>`;
+    const hue = _eventBadgeHues.get(label);
+    if (!hue) {
+        // Erroneous input needs to be sanitized.
+        return `<span class="badge category">${sanitize(label)}</span>`;
+    } else {
+        return `<span class="badge category" style="--hue: ${hue};">${label}</span>`;
+    }
 }
 
 
@@ -1671,28 +1710,38 @@ export async function enableSentry() {
     if (window.location.pathname.startsWith('/mods/')) {
         throw new Error("Please don't use sentry error logging in a mod");
     }
-    if (_sentryEnabled) {
+    if (_sentryEnabled || (window.isElectron && !electron.context.errorReporting)) {
         return;
     }
     _sentryEnabled = true;
-    const [version, id, dsn] = await Promise.all([
-        rpc.getVersion(),
-        rpc.getSentryAnonId(),
-        rpc.getSentryDSN(),
-        import('./sentry.js') // side-effect is self.Sentry
-    ]);
-    if (version && id && dsn) {
-        Sentry.setTag('version', version);
-        Sentry.setUser({id});
+    const [config, Sentry] = await Promise.all([rpc.getSentryConfig(), import('../deps/src/sentry.mjs')]);
+    if (config?.dsn && config?.initialScope?.user?.id) {
         Sentry.init({
-            dsn,
-            beforeSend: Report.beforeSentrySend,
-            integrations: arr => arr.filter(x => !['Breadcrumbs', 'TryCatch'].includes(x.name)),
+            ...config,
             sampleRate: 0.3,
-            release: `sauce4zwift@${version}`,
+            dataCollection: {cookies: false},
+            maxBreadcrumbs: 200,
+            sendClientReports: false,
             normalizeDepth: 12,
+            beforeSend: Report.beforeSentrySend,
+            integrations: ints => ints.map(x => {
+                if (['Console', 'BrowserApiErrors', 'BrowserSession'].includes(x.name)) {
+                    return false;
+                } else {
+                    return x;
+                }
+            }).filter(Boolean),
         });
         Report.setSentry(Sentry);
+        if (drainEarlySentryBreadcrumbs) {
+            for (const x of drainEarlySentryBreadcrumbs()) {
+                Sentry.addBreadcrumb(x);
+            }
+        }
+        document.addEventListener('sentry-breadcrumb', ev => {
+            // IMPORTANT: Do not log from here!
+            Sentry.addBreadcrumb(ev.detail);
+        });
     }
 }
 

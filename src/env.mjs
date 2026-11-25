@@ -13,6 +13,7 @@ const _roads = new Map();
 const _roadsByCourse = new Map();
 const _roadCurvePaths = new Map();
 const _coursesByWorld = new Map();
+let _equipmentOverrides;
 
 export const realWorldCourseId = -2;
 export const worldMetas = {
@@ -84,11 +85,14 @@ export function fromRoadSig(roadSig) {
 
 function readSegmentsForWorld(worldId) {
     const fname = Path.join(__dirname, `../shared/deps/data/worlds/${worldId}/segments.json`);
+    if (!FS.existsSync(fname)) {
+        return [];
+    }
     let segments;
     try {
         segments = JSON.parse(FS.readFileSync(fname));
     } catch(e) {
-        console.error('No segments loaded for world:', worldId);
+        console.error('Failed segments load for world:', worldId, e);
         return [];
     }
     const courseId = getCourseId(worldId);
@@ -265,4 +269,18 @@ export function webMercatorProjection([lat, lng]) {
         0.5 + lng / 360,
         0.5 - Math.log((1 + siny) / (1 - siny)) / (4 * Math.PI),
     ];
+}
+
+
+export function getEquipmentOverrides() {
+    if (!_equipmentOverrides) {
+        const fname = Path.join(__dirname, `../shared/deps/data/equipment_overrides.json`);
+        try {
+            _equipmentOverrides = JSON.parse(FS.readFileSync(fname));
+        } catch(e) {
+            console.error("Failed to read equipment overrides:", e);
+            _equipmentOverrides = [];
+        }
+    }
+    return _equipmentOverrides;
 }

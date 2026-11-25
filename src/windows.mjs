@@ -7,12 +7,13 @@ import * as Patreon from './patreon.mjs';
 import * as RPC from './rpc.mjs';
 import * as Mods from './mods.mjs';
 import {EventEmitter} from 'node:events';
-import {sleep} from '../shared/sauce/base.mjs';
+import {sleep} from './sleep.mjs';
 import {createRequire} from 'node:module';
 import * as Menu from './menu.mjs';
 import * as Main from './main.mjs';
 import * as Mime from './mime.mjs';
 import * as Hotkeys from './hotkeys.mjs';
+import * as Report from '../shared/report.mjs';
 
 const require = createRequire(import.meta.url);
 const electron = require('electron');
@@ -39,6 +40,7 @@ let profiles;
 let activeProfile;
 let swappingProfiles;
 let overlayWindowsVisibility = 'visible';
+let errorReporting;
 
 const defaultWidgetWindows = [{
     id: 'default-overview-1',
@@ -175,7 +177,7 @@ class Profile {
     openWidgetWindows() {
         const controller = new EventEmitter();
         const loading = [];
-        for (const spec of this.getWidgetWindowSpecs().reverse()) {
+        for (const spec of this.getWidgetWindowSpecs().toReversed()) {
             const manifest = widgetWindowManifestsByType.get(spec.type);
             if (!manifest) {
                 // Probably a missing Mod; safe to ignore as it might get re-enabled/added later..
@@ -192,11 +194,22 @@ class Profile {
         }
         let loaded = 0;
         const size = loading.length;
-        for (const x of loading) {
-            x.webContents.once('did-finish-load', () => {
+        for (const win of loading) {
+            const onProgress = () => {
+                win.off('show', onProgress);
+                win.off('closed', onProgress);
                 loaded++;
                 controller.emit('progress', loaded / size, loaded, size);
-            });
+            };
+            win.on('show', onProgress);
+            win.on('closed', onProgress);
+            win.readyState('rendered', {timeout: 200}).then(() => {
+                if (win.spec.type === 'overview') {
+                    win.show();
+                } else {
+                    win.showInactive();
+                }
+            }).catch(Report.error);
         }
         loading.length = 0;
         return controller;
@@ -215,7 +228,6 @@ class SauceBrowserWindow extends electron.BrowserWindow {
         const bounds = options.bounds || getBoundsForDisplay(getCurrentDisplay(), options);
         const session = webPrefs.session || activeProfile.getSession();
         const win = new this({
-            show: false,
             maximizable: false,
             fullscreenable: false,
             ...options,
@@ -235,13 +247,17 @@ class SauceBrowserWindow extends electron.BrowserWindow {
             const hash = options.hash;
             win.loadFile(options.file, {query, hash});
         }
-        if (options.show !== false) {
+        if (options.show === true) {
+            console.warn("Window flashing during load likely");
             win.show();
         }
         return win;
     }
 
-    constructor({spec, subWindow, metaFlags, center, bounds, width, height, x, y, ...options}) {
+    constructor({spec, subWindow, metaFlags, center, bounds, width, height, x, y, show, ...options}) {
+        if (show) {
+            throw new Error('Auto Show Unsupported');
+        }
         super({
             ...options,
             show: false,  // Always start hidden before using setBounds
@@ -250,6 +266,22 @@ class SauceBrowserWindow extends electron.BrowserWindow {
         this.spec = spec;
         this.subWindow = subWindow;
         this.metaFlags = metaFlags;
+        this._firstRender = new Promise(resolve => {
+            const onClosed = () => resolve(false);
+            this.once('ready-to-show', () => {
+                resolve(true);
+                this.off('closed', onClosed);
+            });
+            this.on('closed', onClosed);
+        });
+        this._firstLoad = new Promise(resolve => {
+            const onClosed = () => resolve(false);
+            this.webContents.once('did-finish-load', () => {
+                resolve(true);
+                this.off('closed', onClosed);
+            });
+            this.on('closed', onClosed);
+        });
         if (bounds) {
             // Must manually call setBounds to avoid strange scale/rounding issues
             // See: https://github.com/electron/electron/issues/10862
@@ -265,8 +297,30 @@ class SauceBrowserWindow extends electron.BrowserWindow {
             }
         }
         this._initLogorrheaCheck();
-        if (options.show !== false) {
-            this.show();
+        if (errorReporting) {
+            bounceFetchEvents(this);
+            bounceConsoleEvents(this);
+        }
+    }
+
+    async readyState(states, {timeout}={}) {
+        const conditions = [];
+        if (typeof states === 'string') {
+            states = [states];
+        }
+        for (let i = 0; i < states.length; i++) {
+            if (states[i] === 'rendered') {
+                conditions.push(this._firstRender);
+            } else if (states[i] === 'loaded') {
+                conditions.push(this._firstLoad);
+            } else {
+                throw new TypeError(`Invalid state: ${states[i]}`);
+            }
+        }
+        const ready = Promise.all(conditions);
+        await (timeout ? Promise.race([ready, sleep(timeout)]) : ready);
+        if (this.isDestroyed()) {
+            throw new Error('Window Closed');
         }
     }
 
@@ -280,6 +334,7 @@ class SauceBrowserWindow extends electron.BrowserWindow {
                 let bypassHack = false;
                 if (this.isVisible()) {
                     const curBounds = this.getBounds();
+                    console.warn(curBounds);
                     const sSrc = electron.screen.getDisplayNearestPoint({x: curBounds.x, y: curBounds.y});
                     const sDst = electron.screen.getDisplayNearestPoint({x: bounds.x, y: bounds.y});
                     if (sSrc.id === sDst.id) {
@@ -305,7 +360,7 @@ class SauceBrowserWindow extends electron.BrowserWindow {
         // If the page logs in a tight loop it breaks everything.
         // See: https://github.com/electron/electron/issues/49269
         this._logTimestamp = performance.now();
-        this._logRateExpC = Math.exp(-1 / 10000);
+        this._logRateExpC = Math.exp(-1 / 25000);
         this._logRateWeighted = 1000;
         this._logLoopBucket = 0;
         this.webContents.on('-console-message', this._onLogorrheaCheck.bind(this));
@@ -331,12 +386,12 @@ class SauceBrowserWindow extends electron.BrowserWindow {
 
     _onLogorrheaCheck(ev) {
         const now = performance.now();
-        this._logTimestamp = now;
         this._logRateWeighted *= this._logRateExpC;
         this._logRateWeighted += (now - this._logTimestamp) * (1 - this._logRateExpC);
+        this._logTimestamp = now;
         if (this._logLoopTesting) {
             this._logLoopTestBucket++;
-            if (this._logLoopTestBucket >= 100) {
+            if (this._logLoopTestBucket > this._logLoopTestBucketHigh) {
                 if (this.isDestroyed()) {
                     return;
                 }
@@ -356,7 +411,8 @@ class SauceBrowserWindow extends electron.BrowserWindow {
             console.warn("Possible logorrhea renderer process:", this.ident());
             this._logLoopTesting = true;
             // If the system can't clear a rate bucket with a setImmediate loop then kill it..
-            this._logLoopTestBucket = 50;
+            this._logLoopTestBucket = 100;
+            this._logLoopTestBucketHigh = 2000;
             const drain = () => {
                 if (this._logLoopTermination) {
                     return;
@@ -375,6 +431,17 @@ class SauceBrowserWindow extends electron.BrowserWindow {
             setImmediate(drain);
         }
     }
+}
+
+
+function deepFreeze(obj) {
+    for (const name of Reflect.ownKeys(obj)) {
+        const value = obj[name];
+        if ((value && typeof value === "object") || typeof value === "function") {
+            deepFreeze(value);
+        }
+    }
+    return Object.freeze(obj);
 }
 
 
@@ -411,11 +478,14 @@ function emitWidgetWindowsUpdated(profile) {
 
 export function registerWidgetWindow(manifest) {
     if (widgetWindowManifestsByType.has(manifest.type)) {
-        console.error("Window type already registered:", manifest.type);
+        Report.logError("Window type already registered:", manifest.type);
         throw new TypeError("Window type already registered");
     }
-    widgetWindowManifests.push(manifest);
-    widgetWindowManifestsByType.set(manifest.type, manifest);
+    // To prevent manifest hijacking escapes, copy and freee the object.
+    // We don't want the objects being modified down the line accidentially.
+    const frozen = deepFreeze(structuredClone(manifest));
+    widgetWindowManifests.push(frozen);
+    widgetWindowManifestsByType.set(manifest.type, frozen);
 }
 
 
@@ -489,16 +559,62 @@ function emulateNormalUserAgent(win) {
 }
 
 
+function bounceFetchEvents(win) {
+    // Provide a side effect free way to get network breadcrumbs for error reporting.
+    // WebRequest is shared, so we need to delegate.
+    const wr = win.webContents.session.webRequest;
+    if (!wr._activeFetchListeners) {
+        const listeners = wr._activeFetchListeners = new WeakSet();
+        const filter = {
+            urls: ['<all_urls>'],
+            excludeUrls: ['*://*.sentry.io/*'],
+            types: ['mainFrame', 'subFrame', 'ping', 'xhr', 'webSocket']
+        };
+        wr.onCompleted(filter, ev => {
+            if (listeners.has(ev.webContents) && ev.frame && !ev.frame.isDestroyed()) {
+                ev.frame.send('renderer-fetch', {
+                    timestamp: ev.timestamp,
+                    statusCode: ev.statusCode,
+                    url: ev.url,
+                    method: ev.method,
+                });
+            }
+        });
+        wr.onErrorOccurred(filter, ev => {
+            if (listeners.has(ev.webContents) && ev.frame && !ev.frame.isDestroyed()) {
+                ev.frame.send('renderer-fetch', {
+                    timestamp: ev.timestamp,
+                    url: ev.url,
+                    method: ev.method,
+                    message: ev.error,
+                });
+            }
+        });
+    }
+    wr._activeFetchListeners.add(win.webContents);
+}
+
+
+function bounceConsoleEvents(win) {
+    // Provide a side effect free way to get console breadcrumbs for error reporting.
+    win.webContents.on('console-message', ev => {
+        if (!ev.frame.isDestroyed()) {
+            ev.frame.send('renderer-log', {
+                timestamp: Date.now(),
+                level: ev.level,
+                lineNumber: ev.lineNumber,
+                message: ev.message,
+                sourceId: ev.sourceId,
+            });
+        }
+    });
+}
+
+
 function onHandleFileProtocol(request) {
     // NOTE: Always use path.posix here...
-    const urlOrig = NodeURL.parse(request.url);
-    const urlNew = new URL(request.url);
-    const pathnameOrig = urlOrig.pathname;
-    let pathname = urlNew.pathname;
-    if (pathname !== pathnameOrig) {
-        console.error(request.url, request, urlOrig, urlNew);
-        throw new Error("figure this out");
-    }
+    const url = new URL(request.url);
+    let pathname = url.pathname;
     let rootPath = appPath;
     if (pathname === '/sauce:dummy') {
         return new Response('');
@@ -763,6 +879,10 @@ export function initialize() {
             registerWidgetWindow(x);
         }
     }
+    const displays = electron.screen.getAllDisplays();
+    console.debug("Display configuration:", displays.map(({label, bounds}) =>
+        `${label}: ${bounds.width}x${bounds.height} @ ${bounds.x},${bounds.y}`).join(', '));
+    errorReporting = Report.getSentry() != null;
     let rawProfiles = Storage.get(profilesKey);
     if (!rawProfiles || !rawProfiles.length) {
         const legacy = Storage.get('windows');
@@ -859,7 +979,7 @@ export function activateProfile(id) {
         for (const win of SauceBrowserWindow.getAllWindows()) {
             win._suspendEvents = true;
             if (win !== sourceWin && win.spec && win.webContents.session === oldSession) {
-                win.close();
+                win.destroy();
             }
         }
         newProfile.loadSession();
@@ -964,7 +1084,7 @@ export function removeWidgetWindow(id) {
     const win = getWidgetWindow(id);
     if (win) {
         win._suspendEvents = true;
-        win.close();
+        win.destroy();
     }
     const profile = activeProfile;
     if (!Object.hasOwn(profile.windows, id)) {
@@ -993,11 +1113,13 @@ function initWidgetWindowSpec({id, type, options, ...rem}) {
     if (!manifest) {
         throw new TypeError('Invalid Manifest Type');
     }
+    const uninheritableManifestKeys = ['webPreferences', 'alwaysVisible'];
+    const manifestSpecClone = structuredClone(Object.fromEntries(Object.entries(manifest)
+        .filter(({0: k}) => uninheritableManifestKeys.indexOf(k) === -1)));
     const spec = {
-        ...manifest,
-        id,
-        type,
+        ...manifestSpecClone,
         ...rem,
+        id,
     };
     spec.options = Object.assign({}, spec.options, options);
     return spec;
@@ -1054,7 +1176,7 @@ RPC.register(moveWidgetWindowTop);
 export function reopenWidgetWindow(id) {
     const win = getWidgetWindow(id);
     if (win) {
-        win.close();
+        win.destroy();
     }
     openWidgetWindow(id);
 }
@@ -1064,38 +1186,41 @@ RPC.register(reopenWidgetWindow);
 export function closeWidgetWindow(id) {
     const win = getWidgetWindow(id);
     if (win) {
-        win.close();
+        win.destroy();
     }
 }
 RPC.register(closeWidgetWindow);
 
 
-export function openWidgetWindow(id) {
+export async function openWidgetWindow(id) {
     const profile = activeProfile;
     const spec = profile.getWidgetWindowSpec(id);
     if (spec.closed) {
         profile.updateWidgetWindowSpec(id, {closed: false});
     }
-    _openSpecWindow(spec, profile);
+    const win = _openSpecWindow(spec, profile);
+    await win.readyState('rendered', {timeout: 200});
+    win.show();
 }
 RPC.register(openWidgetWindow);
 
 
 export function openSettingsWindow({x, y, width=520, height=800, bounds, hash}={}) {
-    // Bit of a hack to reuse the spec from the normal overview windows...
+    // Bit of a hack to reuse the id from the normal overview window...
     const type = 'overview';
     const id = getWidgetWindowSpecs().find(x => x.type === type).id;
-    const manifest = widgetWindowManifestsByType.get(type);
+    const spec = initWidgetWindowSpec({id, type});
     const placement = bounds ? {bounds} : {x, y, width, height};
-    SauceBrowserWindow.make({
+    const win = SauceBrowserWindow.make({
         file: '/pages/overview-settings.html',
         ...placement,
         hash,
         frame: false,
         transparent: true,
         subWindow: true,
-        spec: {...manifest, id, type}
+        spec,
     });
+    win.readyState('rendered', {timeout: 200}).then(() => win.show()).catch(Report.error);
 }
 RPC.register(openSettingsWindow);
 
@@ -1103,26 +1228,25 @@ RPC.register(openSettingsWindow);
 function scrubProfile(profile) {
     let modified = false;
     const winIds = new Set();
-    const remove = new Set();
-    for (const [id, spec] of Object.entries(profile.windows)) {
-        if (spec.id === undefined) {
-            // TMP: Remove/change after a couple releases..
-            // Cleanup leaked closed windows regrssion from 2.1.0(beta/alpha)
-            remove.add(id);
-        } else if (spec.id !== id) {
-            console.error("Corrupt window:", profile.id, id, spec);
-        } else {
-            winIds.add(id);
+    const windows = Object.entries(profile.windows);
+    for (const {0: id, 1: spec} of windows) {
+        if (spec.id !== id) {
+            Report.logError("Fixing corrupt window ID:", id, '!=', spec.id);
+            modified = true;
+            spec.id = id;
         }
+        winIds.add(id);
     }
-    if (remove.size) {
+    if (!windows.some(({1: spec}) => spec.type === 'overview')) {
+        // A few users have found this case, but I have yet to understand how..
+        Report.logError('Profile corrupt - Missing required Overview window', profile.id,
+                        profile.name, profile.windows);
+        const id = `repaired-overview-${Date.now()}-${Math.random() * 10000000 | 0}`;
         modified = true;
-        for (const x of remove) {
-            console.warn("Removing window with bad spec ID", profile.id, x);
-            delete profile.windows[x];
-        }
+        profile.windows[id] = initWidgetWindowSpec({id, type: 'overview'});
     }
     if (!profile.windowStack) {
+        modified = true;
         profile.windowStack = [];
     } else {
         const scrubbed = profile.windowStack.filter(x => {
@@ -1138,9 +1262,11 @@ function scrubProfile(profile) {
         }
     }
     if (!profile.subWindowSettings) {
+        modified = true;
         profile.subWindowSettings = {};
     }
     if (!profile.settings) {
+        modified = true;
         profile.settings = {};
     }
     return modified;
@@ -1349,7 +1475,6 @@ function handleNewSubWindow(parent, spec, webPrefs, {profile}={}) {
             subWindow: true,
             spec: newWinSpec,
             frame,
-            show: false,
             transparent: frame === false,
             hasShadow: frame !== false,
             roundedCorners: frame !== false,
@@ -1390,43 +1515,66 @@ function handleNewSubWindow(parent, spec, webPrefs, {profile}={}) {
 }
 
 
-async function getWindowsStorage(session) {
-    const win = new electron.BrowserWindow({
+function makeStorageProxyWindow(session) {
+    return new electron.BrowserWindow({
         show: false,
+        offscreen: true,
+        paintWhenInitiallyHidden: false,
         webPreferences: {
             session,
             preload: Path.join(appPath, 'src/preload/storage-proxy.js'),
         }
     });
-    let _resolve;
-    win.webContents.on('ipc-message', (ev, ch, storage) => _resolve(storage));
-    win.webContents.on('did-finish-load', () => win.webContents.send('export'));
-    const p = new Promise(resolve => _resolve = resolve);
-    let storage;
+}
+
+
+async function getWindowsStorage(session) {
+    const win = makeStorageProxyWindow(session);
+    const p = new Promise((resolve, reject) => {
+        win.webContents.on('ipc-message', (ev, ch, storageJson) => {
+            try {
+                resolve(JSON.parse(storageJson));
+            } catch(e) {
+                reject(e);
+            }
+        });
+        win.webContents.on('did-finish-load', () => {
+            try {
+                win.webContents.send('export');
+            } catch(e) {
+                reject(e);
+            }
+        });
+    });
     try {
         win.loadURL('file:///sauce:dummy');
-        storage = await p;
+        return await p;
     } finally {
         if (!win.isDestroyed()) {
             win.destroy();
         }
     }
-    return storage;
 }
 
 
 async function setWindowsStorage(storage, session) {
-    const win = new electron.BrowserWindow({
-        show: false,
-        webPreferences: {
-            session,
-            preload: Path.join(appPath, 'src/preload/storage-proxy.js'),
-        }
+    const win = makeStorageProxyWindow(session);
+    const p = new Promise((resolve, reject) => {
+        win.webContents.on('ipc-message', (ev, ch, resp) => {
+            if (!resp?.success) {
+                reject(new Error(resp?.error || 'Internal Error'));
+            } else {
+                resolve();
+            }
+        });
+        win.webContents.on('did-finish-load', () => {
+            try {
+                win.webContents.send('import', JSON.stringify(storage));
+            } catch(e) {
+                reject(e);
+            }
+        });
     });
-    let _resolve, _reject;
-    win.webContents.on('ipc-message', (ev, ch, success) => success ? _resolve() : _reject());
-    win.webContents.on('did-finish-load', () => win.webContents.send('import', storage));
-    const p = new Promise((resolve, reject) => (_resolve = resolve, _reject = reject));
     try {
         win.loadURL('file:///sauce:dummy');
         await p;
@@ -1451,6 +1599,7 @@ function _openSpecWindow(spec, profile) {
     const inBounds = !bounds || isWithinDisplayBounds(bounds);
     if (!inBounds) {
         console.warn("Resetting window that is out of bounds:", id, bounds);
+        console.debug("Detected screens:", electron.screen.getAllDisplays());
     }
     if (!inBounds || !bounds) {
         bounds = getBoundsForDisplay(getCurrentDisplay(), {...manifest.options, ...spec.options});
@@ -1471,7 +1620,6 @@ function _openSpecWindow(spec, profile) {
         ...options,
         bounds,
         spec,
-        show: false,
         frame,
         transparent: frame === false,
         hasShadow: frame !== false,
@@ -1504,13 +1652,13 @@ function _openSpecWindow(spec, profile) {
             return;
         }
         // Mitigation for windows drift issues when scaling != 100%
-        if (isWindows && !boundsSaveTimeout && performance.now() - createdTS < 500) {
+        if ((isWindows || isLinux) && !boundsSaveTimeout && performance.now() - createdTS < 500) {
             const {width, height, x, y} = win.getBounds();
             if (Math.abs(width - bounds.width) < 3 &&
                 Math.abs(height - bounds.height) < 3 &&
                 Math.abs(x - bounds.x) < 3 &&
                 Math.abs(y - bounds.y) < 3) {
-                console.warn("Dropping spurious window movement:", id);
+                console.debug("Dropping spurious window movement:", id);
                 return;
             }
         }
@@ -1530,7 +1678,7 @@ function _openSpecWindow(spec, profile) {
         win.on('resize', onBoundsUpdate);
         win.on('focus', () => void (!win._suspendEvents && profile.saveWidgetWindowAsTop(id)));
         win.on('closed', () => {
-            if (!manifest.alwaysVisible && !win._suspendEvents) {
+            if (!Main.quiting && !manifest.alwaysVisible && !win._suspendEvents) {
                 profile.updateWidgetWindowSpec(id, {closed: true});
             }
         });
@@ -1540,7 +1688,6 @@ function _openSpecWindow(spec, profile) {
     p.name += `.___${id}___`;
     p.base = undefined;
     win.loadFile(Path.format(p), {query});
-    win.show();
     return win;
 }
 
@@ -1581,10 +1728,17 @@ export function restoreWidgetWindowPositions() {
 RPC.register(restoreWidgetWindowPositions);
 
 
-export function openEphemeralWindow(type, options) {
+function createEphemeralWindow(type, options) {
     const id = `internal-ephemeral-${type}`;
     const spec = initWidgetWindowSpec({type, id, ephemeral: true, options});
     return _openSpecWindow(spec, activeProfile);
+}
+
+
+export async function openEphemeralWindow(type, options) {
+    const win = createEphemeralWindow(type, options);
+    await win.readyState('rendered', {timeout: 200});
+    win.show();
 }
 
 
@@ -1593,7 +1747,6 @@ export async function eulaConsent() {
         return true;
     }
     const win = SauceBrowserWindow.make({file: '/pages/eula.html'});
-    let closed;
     const consenting = new Promise(resolve => {
         RPC.register(agree => {
             if (agree === true) {
@@ -1604,11 +1757,13 @@ export async function eulaConsent() {
                 resolve(false);
             }
         }, {name: 'eulaConsent'});
-        win.on('closed', () => (closed = true, resolve(false)));
+        win.on('closed', () => resolve(false));
     });
+    await win.readyState(['rendered', 'loaded'], {timeout: 500});
+    win.show();
     const consent = await consenting;
-    if (!closed) {
-        win.close();
+    if (!win.isDestroyed()) {
+        win.destroy();
     }
     return consent;
 }
@@ -1621,14 +1776,14 @@ export async function updateConfirmationWindow(version) {
         width: 400,
         height: 440,
     });
-    let closed;
     const prompting = new Promise(resolve => {
         RPC.register(resolve, {name: 'confirmAppUpdate'});
-        win.on('closed', () => (closed = true, resolve(false)));
+        win.on('closed', () => resolve(false));
     });
+    win.show();
     const doUpdate = await prompting;
-    if (!closed && !doUpdate) {
-        win.close();
+    if (!doUpdate && !win.isDestroyed()) {
+        win.destroy();
     }
     if (doUpdate) {
         return win;
@@ -1637,8 +1792,11 @@ export async function updateConfirmationWindow(version) {
 
 
 export async function showReleaseNotes() {
-    const win = openEphemeralWindow('release-notes');
-    await new Promise(resolve => win.on('closed', resolve));
+    const win = createEphemeralWindow('release-notes');
+    const closed = new Promise(resolve => win.on('closed', resolve));
+    await win.readyState('rendered', {timeout: 500});
+    win.show();
+    await closed;
 }
 
 
@@ -1647,11 +1805,9 @@ export async function zwiftLogin(options) {
         file: options.monitor ? '/pages/zwift-monitor-login.html' : '/pages/zwift-login.html',
         width: options.monitor ? 540 : 460,
         height: options.monitor ? 730 : 500,
-        show: false,
     }, {
         preload: Path.join(appPath, 'src/preload/zwift-login.js'),
     });
-    let closed;
     let setDone;
     const done = new Promise(resolve => setDone = resolve);
     const onCreds = async (ev, {username, password}) => {
@@ -1662,17 +1818,14 @@ export async function zwiftLogin(options) {
             win.webContents.send('validation-error', e);
         }
     };
-    win.on('closed', () => {
-        closed = true;
-        setDone();
-    });
+    win.on('closed', () => setDone());
     win.webContents.ipc.on('zwift-creds', onCreds);
     win.show();
     try {
         return await done;
     } finally {
-        if (!closed) {
-            win.close();
+        if (!win.isDestroyed()) {
+            win.destroy();
         }
     }
 }
@@ -1687,7 +1840,6 @@ export function dialog(options) {
         file: '/pages/dialog.html',
         width,
         height: affectedBySizeBug ? height + 28 : height,
-        show: false,
         frame: false,
         transparent: true,
         minimizable: false,
@@ -1705,16 +1857,12 @@ export function dialog(options) {
         devTools: !electron.app.isPackaged,
         preload: Path.join(appPath, 'src/preload/dialog.js'),
     });
-    let closed;
     const controller = new Promise(resolve => {
-        win.on('closed', () => {
-            closed = true;
-            resolve(false);
-        });
+        win.on('closed', () => resolve(false));
         win.webContents.ipc.handle('confirm-dialog-response', (ev, confirmed) => resolve(confirmed));
     });
     const setContent = (key, value) => {
-        if (!closed && !win.isDestroyed()) {
+        if (!win.isDestroyed()) {
             win.webContents.send('set-content', key, value);
         }
     };
@@ -1724,39 +1872,37 @@ export function dialog(options) {
     controller.setDetail = x => setContent('detail', x);
     controller.setFooter = x => setContent('footer', x);
     controller.close = () => {
-        if (!closed && !win.isDestroyed()) {
-            win.close();
+        if (!win.isDestroyed()) {
+            win.destroy();
         }
     };
     controller.hide = () => {
-        if (!closed && !win.isDestroyed()) {
+        if (!win.isDestroyed()) {
             win.hide();
+        } else {
+            console.warn('Dialog already closed');
         }
     };
     controller.show = () => {
-        if (!closed && !win.isDestroyed()) {
+        if (!win.isDestroyed()) {
             win.show();
+        } else {
+            console.warn('Dialog already closed');
         }
     };
     controller.finally(() => {
-        if (!closed && !win.isDestroyed()) {
-            win.close();
+        if (!win.isDestroyed()) {
+            win.destroy();
         }
     });
     if (options.show !== false) {
-        controller.visible = new Promise(resolve => {
-            win.once('ready-to-show', () => {
-                if (!closed && !win.isDestroyed()) {
-                    win.show();
-                    if (affectedBySizeBug && win.getBounds().height !== height) {
-                        console.warn("Corrected macos modal window height");
-                        win.setSize(width, height);
-                    }
-                    resolve(true);
-                } else {
-                    resolve(false);
-                }
-            });
+        controller.visible = win.readyState(['rendered', 'loaded'], {timeout: 400}).then(() => {
+            win.show();
+            if (affectedBySizeBug && win.getBounds().height !== height) {
+                console.warn("Corrected macos modal window height");
+                win.setSize(width, height);
+            }
+            return true;
         });
     } else if (affectedBySizeBug) {
         console.warn("Dialog might be too small because of mac modal bug");
@@ -1779,7 +1925,6 @@ export async function welcomeSplash() {
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
-        show: false,
         transparent: true,
         hasShadow: false,
         frame: false,
@@ -1796,8 +1941,9 @@ export async function welcomeSplash() {
     welcomeWin.setAlwaysOnTop(true, 'screen-saver');
     welcomeWin.setIgnoreMouseEvents(true);
     welcomeWin.loadFile('/pages/welcome.html');
+    await welcomeWin.readyState(['rendered', 'loaded'], {timeout: 800});
     welcomeWin.show();
-    return await sleep(16500).then(() => welcomeWin.close());
+    return await sleep(16500).then(() => welcomeWin.destroy());
 }
 
 
@@ -1822,7 +1968,6 @@ export function systemMessage(msg) {
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
-        show: false,
         transparent: true,
         hasShadow: false,
         frame: false,
@@ -1865,20 +2010,29 @@ export async function patronLink({sauceApp, requireLegacy, forceCheck}) {
         win.webContents.session.clearStorageData();
         win.webContents.session.clearCache();
         electron.app.relaunch();
-        win.close();
+        electron.app.quit();
     });
-    let resolve;
-    win.webContents.ipc.on('patreon-special-token', (ev, token) => resolve({token}));
-    win.webContents.ipc.on('patreon-auth-code', (ev, code) => resolve({code, legacy: true}));
+    let interaction, resolveInteraction;
+    const interactionHandle = resolve => {
+        resolveInteraction = (...args) => {
+            interaction = new Promise(interactionHandle);
+            resolve(...args);
+        };
+    };
+    interaction = new Promise(interactionHandle);
+    win.webContents.ipc.on('patreon-special-token', (ev, token) => resolveInteraction({token}));
+    win.webContents.ipc.on('patreon-auth-code', (ev, code) => resolveInteraction({code, legacy: true}));
     sauceApp.on('external-open', x => {
         if (x.name === 'patron' && x.path === '/link') {
-            resolve({code: x.data.code});
+            resolveInteraction({code: x.data.code});
         }
     });
-    win.on('closed', () => resolve({closed: true}));
+    win.on('closed', () => resolveInteraction({closed: true}));
+    await win.readyState(['rendered', 'loaded'], {timeout: 600});
+    win.show();
     let isMember = false;
     while (true) {
-        const {code, token, closed, legacy} = await new Promise(_resolve => resolve = _resolve);
+        const {code, token, closed, legacy} = await interaction;
         let isAuthed;
         if (closed) {
             return isMember;
@@ -1908,33 +2062,7 @@ export async function patronLink({sauceApp, requireLegacy, forceCheck}) {
 }
 
 
-
-function closeOwnWindow(width, height, options={}) {
-    const win = requireElectronSenderWindowForRPC(this);
-    console.debug('Window close requested:', win.ident());
-    win.close();
-}
-RPC.register(closeOwnWindow);
-
-function minimizeOwnWindow() {
-    const win = requireElectronSenderWindowForRPC(this);
-    console.debug('Window minimize requested:', win.ident());
-    win.minimize();
-}
-RPC.register(minimizeOwnWindow);
-
-RPC.register(function resizeOwnWindow(width, height, options={}) {
-    const win = requireElectronSenderWindowForRPC(this);
-    _resizeWindowRPCImpl(win, width, height, options);
-});
-
-function resizeOwnWindow(width, height, options={}) {
-    const win = requireElectronSenderWindowForRPC(this);
-    _resizeWindowRPCImpl(win, width, height, options);
-}
-RPC.register(resizeOwnWindow);
-
-function _resizeWindowRPCImpl(win, width, height, options) {
+function resizeWindowRPCImpl(win, width, height, options) {
     if (options.constrainToDisplay) {
         const bounds = getCurrentDisplay().bounds;
         const aspectRatio = width / height;
@@ -1965,6 +2093,32 @@ function _resizeWindowRPCImpl(win, width, height, options) {
         win.setSize(Math.round(width), Math.round(height));
     }
 }
+
+
+function closeOwnWindow(width, height, options={}) {
+    const win = requireElectronSenderWindowForRPC(this);
+    console.debug('Window close requested:', win.ident());
+    win.destroy();
+}
+RPC.register(closeOwnWindow);
+
+function minimizeOwnWindow() {
+    const win = requireElectronSenderWindowForRPC(this);
+    console.debug('Window minimize requested:', win.ident());
+    win.minimize();
+}
+RPC.register(minimizeOwnWindow);
+
+RPC.register(function resizeOwnWindow(width, height, options={}) {
+    const win = requireElectronSenderWindowForRPC(this);
+    resizeWindowRPCImpl(win, width, height, options);
+});
+
+function resizeOwnWindow(width, height, options={}) {
+    const win = requireElectronSenderWindowForRPC(this);
+    resizeWindowRPCImpl(win, width, height, options);
+}
+RPC.register(resizeOwnWindow);
 
 RPC.register(function moveOwnWindowTop() {
     const win = requireElectronSenderWindowForRPC(this);
@@ -2036,6 +2190,7 @@ electron.ipcMain.on('getWindowMetaSync', ev => {
             id: null,
             type: null,
             platform,
+            errorReporting,
         },
     };
     try {
@@ -2092,7 +2247,7 @@ RPC.register(function closeWindow() {
         return;
     }
     console.debug('Window close requested:', win.ident());
-    win.close();
+    win.destroy();
 }, {deprecatedBy: closeOwnWindow});
 RPC.register(function minimizeWindow() {
     const win = this.getOwnerBrowserWindow();
@@ -2108,7 +2263,7 @@ RPC.register(function resizeWindow(width, height, options={}) {
         console.error('Invalid use of resizeWindow:', 'electron-only');
         return;
     }
-    _resizeWindowRPCImpl(win, width, height, options);
+    resizeWindowRPCImpl(win, width, height, options);
 }, {deprecatedBy: resizeOwnWindow});
 RPC.register(showOverlayWindows, {name: 'showAllWindows', deprecatedBy: showOverlayWindows});
 RPC.register(hideOverlayWindows, {name: 'hideAllWindows', deprecatedBy: hideOverlayWindows});

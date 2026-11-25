@@ -9,6 +9,7 @@ import * as RPC from './rpc.mjs';
 import {createRequire} from 'node:module';
 import * as Secrets from './secrets.mjs';
 import * as Zwift from './zwift.mjs';
+import {sleep} from './sleep.mjs';
 import * as Windows from './windows.mjs';
 import * as Mods from './mods.mjs';
 import {parseArgs} from './argparse.mjs';
@@ -122,15 +123,6 @@ function quit(retcode) {
 RPC.register(quit);
 
 
-function timeout(ms) {
-    return new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms));
-}
-
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 
 async function quitAfterDelay(delay) {
     if (isMac && sauceApp.getSetting('emulateFullscreenZwift')) {
@@ -164,7 +156,7 @@ async function quitAfterDelay(delay) {
     });
     try {
         if (await Promise.race([dialog, timeout])) {
-            Electron.app.quit();
+            quit();
         } else if (isMac && sauceApp.getSetting('emulateFullscreenZwift')) {
             Windows.activateFullscreenZwiftEmulation();  // bg okay
         }
@@ -192,7 +184,7 @@ Electron.app.on('second-instance', (ev,_, __, {type, ...args}) => {
         Electron.app.emit('open-url', null, args.url);
     }
 });
-Electron.app.on('before-quit', () => void (quiting = true));
+Electron.app.prependListener('before-quit', () => void (quiting = true));
 
 
 function rpcDelegationRemoveSubscription(sub) {
@@ -206,59 +198,64 @@ function rpcDelegationRemoveSubscription(sub) {
 }
 
 
-function monitorWindowForEventSubs(win, subs) {
+function monitorWindowForSubscriptions(win, subs) {
     // NOTE: MacOS emits show/hide AND restore/minimize but Windows only does restore/minimize
     const resumeEvents = ['responsive', 'show', 'restore'];
     const suspendEvents = ['unresponsive', 'hide', 'minimize'];
-    const shutdownEvents = ['destroyed', 'did-navigate'];
+    const shutdownEventsForWebContents = ['destroyed', 'did-navigate'];
     const listeners = [];
-    const resume = (who) => {
+    const winIdent = win.ident();
+    const resume = who => {
         for (const x of subs) {
             if (x.suspended) {
-                console.debug("Resumed subscription:", x.event, win.ident(), who);
+                console.debug("Resuming subscription:", x.event, winIdent, who);
                 x.suspended = false;
             }
         }
     };
-    const suspend = (who) => {
+    const suspend = who => {
         for (const x of subs) {
             if (!x.suspended && !x.persistent) {
-                console.debug("Suspended subscription:", x.event, win.ident(), who);
                 x.suspended = true;
+                console.debug("Suspended subscription:", x.event, winIdent, who);
             }
         }
     };
-    const shutdown = () => {
+    let didShutdown;
+    const shutdown = ev => {
+        if (didShutdown) {
+            return;
+        }
+        didShutdown = true;
         windowEventSubs.delete(win);
         for (const sub of subs) {
             rpcDelegationRemoveSubscription(sub);
             // Must be after unsubscribe() because of logs source which eats its own tail otherwise.
-            console.debug("Shutdown subscription:", sub.event, win.ident());
-        }
-        if (!win.isDestroyed()) {
-            for (const x of shutdownEvents) {
-                win.webContents.off(x, shutdown);
-            }
-            for (const [name, cb] of listeners) {
-                win.off(name, cb);
-            }
+            console.debug("Shutdown subscription:", sub.event, winIdent);
         }
         subs.length = 0;
+        if (!win.isDestroyed()) {
+            for (const {event, callback, emitter} of listeners) {
+                emitter.off(event, callback);
+            }
+        }
+        listeners.length = 0;
     };
-    for (const x of shutdownEvents) {
-        win.webContents.once(x, shutdown);
+    win.on('closed', shutdown);
+    listeners.push({event: 'closed', callback: shutdown, emitter: win});
+    for (const event of shutdownEventsForWebContents) {
+        win.webContents.on(event, shutdown);
+        listeners.push({event, callback: shutdown, emitter: win.webContents});
     }
-    for (const x of resumeEvents) {
-        const cb = ev => resume(x, ev);
-        win.on(x, cb);
-        listeners.push([x, cb]);
+    for (const event of resumeEvents) {
+        const callback = () => void resume(event);
+        win.on(event, callback);
+        listeners.push({event, callback, emitter: win});
     }
-    for (const x of suspendEvents) {
-        const cb = ev => {
-            suspend(x, ev);
-        };
-        win.on(x, cb);
-        listeners.push([x, cb]);
+    for (const event of suspendEvents) {
+        const callback = () => void suspend(event);
+        win.on(event, callback);
+        listeners.push({event, callback, emitter: win});
     }
 }
 
@@ -316,7 +313,7 @@ Electron.ipcMain.handle('subscribe', (ev, {event, persistent, source='stats', op
     } else {
         subs = [sub];
         windowEventSubs.set(win, subs);
-        monitorWindowForEventSubs(win, subs);
+        monitorWindowForSubscriptions(win, subs);
     }
     ev.sender.postMessage('subscribe-port', subId, [theirPort]);
     return subId;
@@ -340,7 +337,10 @@ Electron.ipcMain.handle('rpc', (ev, name, ...args) =>
     RPC.invoke.call(ev.sender, name, ...args).then(JSON.stringify));
 
 RPC.register(() => isDEV, {name: 'isDEV'});
-RPC.register(url => Electron.shell.openExternal(url), {name: 'openExternalLink'});
+RPC.register(url => {
+    App.assertValidExternalLink(url);
+    Electron.shell.openExternal(url);
+}, {name: 'openExternalLink'});
 
 
 async function zwiftLogout(id) {
@@ -373,13 +373,16 @@ async function checkForUpdates(channel) {
     autoUpdater.once('update-available', () => void (updateAvail = true));
     console.info(`Checking for update on channel: ${autoUpdater.channel}`);
     try {
-        const update = await autoUpdater.checkForUpdates();
+        const update = await Promise.race([
+            autoUpdater.checkForUpdates(),
+            sleep(10_000).then(() => {throw new Error('timeout');})
+        ]);
         if (updateAvail) {
             return update.updateInfo;
         }
     } catch(e) {
         // A variety of non critical conditions can lead to this, log and move on.
-        console.warn("Auto update problem:", e.stack);
+        console.error("Auto update problem:", e.stack);
         return;
     }
 }
@@ -555,7 +558,7 @@ async function maybeDownloadAndInstallUpdate({version}) {
         Report.error(e);
         await Electron.dialog.showErrorBox('Update error', '' + e);
         if (!confirmWin.isDestroyed()) {
-            confirmWin.close();
+            confirmWin.destroy();
         }
         return;
     }
@@ -607,8 +610,7 @@ async function reauthZwift() {
 }
 
 
-export async function main({logEmitter, logFile, logQueue, sentryAnonId,
-                            loaderSettings, saveLoaderSettings, buildEnv}) {
+export async function main({logEmitter, logFile, logQueue, loaderSettings, saveLoaderSettings, buildEnv}) {
     const s = Date.now();
     const args = parseArgs([
         // Do not remove headless arg.  It's informational here but handled by loader.mjs
@@ -630,9 +632,10 @@ export async function main({logEmitter, logFile, logQueue, sentryAnonId,
         return;
     }
     const appPath = Electron.app.getPath('userData');
+    const logPath = Electron.app.getPath('logs');
     Storage.initialize(appPath);
     Windows.initialize();
-    sauceApp = new ElectronSauceApp({appPath, buildEnv});
+    sauceApp = new ElectronSauceApp({appPath, logPath, isDEV, buildEnv});
     global.sauceApp = sauceApp;
     startupDialog = createStartupDialog();
     if (logEmitter) {
@@ -641,8 +644,11 @@ export async function main({logEmitter, logFile, logQueue, sentryAnonId,
         RPC.register(() => logQueue.length = 0, {name: 'clearLogs'});
         RPC.register(() => Electron.shell.showItemInFolder(logFile), {name: 'showLogInFolder'});
     }
-    RPC.register(() => sentryAnonId, {name: 'getSentryAnonId'});
-    RPC.register(() => !isDEV ? buildEnv.sentry_dsn : null, {name: 'getSentryDSN'});
+    const sentryCommonConfig = Report.getSentryCommonConfig();
+    RPC.register(() => sentryCommonConfig?.initialScope?.user?.id || null,
+                 {name: 'getSentryAnonId', deprecated: true});
+    RPC.register(() => sentryCommonConfig?.dsn || null, {name: 'getSentryDSN', deprecated: true});
+    RPC.register(() => sentryCommonConfig, {name: 'getSentryConfig'});
     RPC.register(key => loaderSettings[key], {name: 'getLoaderSetting'});
     RPC.register(() => loaderSettings, {name: 'getLoaderSettings'});
     RPC.register((key, value) => {
@@ -729,7 +735,7 @@ export async function main({logEmitter, logFile, logQueue, sentryAnonId,
     try {
         await Promise.race([
             rrtClock.wait(),
-            timeout(10_000)
+            sleep(10_000).then(() => {throw new Error('timeout');})
         ]);
     } catch(e) {
         console.warn("Failed to get robust time source (in timely manor):", e);

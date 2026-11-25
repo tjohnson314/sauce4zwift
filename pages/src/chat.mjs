@@ -15,6 +15,7 @@ const settings = Common.settingsStore.get(null, {
 });
 const athleteChatElements = new Map();
 
+let hasGameConnection = null;
 let dmTargetingId = null;
 
 const q = new URLSearchParams(window.location.search);
@@ -83,7 +84,7 @@ function liveDataFormatter(data) {
         data.stats.power.smooth[15] != null ?
             H.power(data.stats.power.smooth[15], {suffix: true, html: true}) :
             null,
-        data.state.heartrate ? H.number(data.state.heartrate, {suffix: 'bpm', html: true}) : null,
+        data.state?.heartrate ? H.number(data.state.heartrate, {suffix: 'bpm', html: true}) : null,
     ];
     const gap = data.watching ? null : data.gap;
     if (gap != null) {
@@ -113,7 +114,8 @@ async function setDMTargeting(id) {
     dmTargetingId = id;
     doc.querySelector('#send-message').dataset.dmId = id;
     doc.querySelector('.dm-selection .avatar img').src = athlete?.avatar || 'images/blankavatar.png';
-    doc.querySelector('.dm-selection').title = `Direct messaging ${athlete?.sanitizedFullname || id}`;
+    doc.querySelector('.dm-selection').title =
+        `Direct messaging ${Common.sanitize(athlete?.sanitizedFullname || id)}`;
     doc.querySelector('#send-message input').placeholder = 'Direct Message...';
 }
 
@@ -128,7 +130,26 @@ function clearDMTargeting() {
 
 
 function updateConnStatus(status) {
-    doc.classList.toggle('has-game-connection', !!status?.connected);
+    doc.classList.toggle('has-game-connection', (hasGameConnection = !!status?.connected));
+}
+
+
+async function onDirectMessageClick(ev) {
+    const dialog = document.querySelector('#direct-message-picker');
+    const mainEl = dialog.querySelector('main');
+    mainEl.replaceChildren();
+    dialog.showModal();
+    const nearby = await Common.rpc.getNearbyData();
+    console.log(nearby);
+    mainEl.innerHTML = nearby.map(x => {
+        return `
+            <div class="dm-athlete" data-id="${x.athleteId}">
+                <img class="avatar" src="${Common.sanitizeAttr(x.athlete?.avatar ||
+                                                               '/pages/images/blankavatar.png')}"/>
+                <div class="dm-name">${Common.sanitize(x.athlete?.sanitizedFullname || x.athleteId)}</div>
+            </div>
+        `;
+    }).join('\n');
 }
 
 
@@ -142,6 +163,17 @@ export async function main() {
         }
     });
     document.querySelector('#send-message ms#send-icon').addEventListener('click', sendMessage);
+    document.querySelector('#titlebar .button.dm').addEventListener('click', onDirectMessageClick);
+    document.querySelector('#direct-message-picker header .button.close').addEventListener('click', ev =>
+        ev.target.closest('dialog').close());
+    document.querySelector('#direct-message-picker main').addEventListener('click', ev => {
+        const dmTarget = ev.target.closest('.dm-athlete');
+        if (!dmTarget) {
+            return;
+        }
+        setDMTargeting(+dmTarget.dataset.id);
+        ev.target.closest('dialog').close();
+    });
     doc.addEventListener('click', ev => {
         const dm = ev.target.closest('.dm-reply');
         if (!dm) {
@@ -250,7 +282,8 @@ export async function main() {
             entry.innerHTML = `
                 <a href="profile.html?id=${chat.from}&windowType=profile"
                    target="profile_popup_${chat.from}"
-                   class="avatar"><img src="${chat.avatar || 'images/blankavatar.png'}"/></a>
+                   class="avatar"><img src="${Common.sanitizeAttr(chat.avatar ||
+                                                                  'images/blankavatar.png')}"/></a>
                 <div class="content">
                     <div class="header">
                         <div class="name">${Common.sanitize(name)}</div>
@@ -270,7 +303,9 @@ export async function main() {
             entry.innerHTML = `<div class="content">Muted message from: ${Common.sanitize(name)}</div>`;
         }
         entry.addEventListener('dblclick', async () => {
-            await Common.rpc.watch(chat.from);
+            if (hasGameConnection) {
+                await Common.rpc.watch(chat.from);
+            }
         });
         addContentEntry(chat, entry, age, options);
         return entry;

@@ -1,7 +1,6 @@
 import Process from 'node:process';
 import OS from 'node:os';
 import Path from 'node:path';
-import ChildProcess from 'node:child_process';
 import Events from 'node:events';
 import FS from './fs-safe.js';
 import * as Storage from './storage.mjs';
@@ -14,6 +13,10 @@ import * as Logging from './logging.js';
 
 Error.stackTraceLimit = 25;
 Events.defaultMaxListeners = 100;
+
+// Emulate Electron defaults of not crashing on errors..
+Process.on('unhandledRejection', e => void console.error("Unhandled Rejection:", e));
+Process.on('uncaughtException', e => void console.error("Uncaught Exception:", e));
 
 const isDEV = true;
 
@@ -32,13 +35,8 @@ RPC.register(restart);
 
 
 RPC.register(() => isDEV, {name: 'isDEV'});
-RPC.register(url => {
-    const opener = {
-        darwin: 'open',
-        win32: 'explorer.exe',
-        linux: 'xdg-open'
-    }[Process.platform];
-    ChildProcess.execSync(`${opener} ${url}`, {windowsHide: true});
+RPC.register(() => {
+    throw new Error("Unsupported");
 }, {name: 'openExternalLink'});
 RPC.register(key => undefined, {name: 'getLoaderSetting'});
 RPC.register(() => {}, {name: 'getLoaderSettings'});
@@ -123,8 +121,9 @@ async function main() {
         quit(!args ? 1 : 0);
         return;
     }
-    RPC.register(() => null, {name: 'getSentryAnonId'});
-    RPC.register(() => null, {name: 'getSentryDSN'});
+    RPC.register(() => null, {name: 'getSentryAnonId', deprecated: true});
+    RPC.register(() => null, {name: 'getSentryDSN', deprecated: true});
+    RPC.register(() => null, {name: 'getSentryConfig'});
     const exclusions = await App.getExclusions(appPath);
     const zwiftAPI = new Zwift.ZwiftAPI({exclusions});
     const zwiftMonitorAPI = new Zwift.ZwiftAPI({exclusions});
@@ -144,4 +143,7 @@ async function main() {
     await sauceApp.start({...args, exclusions, zwiftAPI, zwiftMonitorAPI});
     console.debug(`Startup took ${Date.now() - s}ms`);
 }
-main();
+main().catch(e => {
+    console.error("Startup failed:", e);
+    quit(1);
+});

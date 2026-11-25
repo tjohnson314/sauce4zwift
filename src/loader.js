@@ -8,6 +8,7 @@ const Package = require('../package.json');
 const Logging = require('./logging.js');
 const {app, dialog, nativeTheme, protocol} = require('electron');
 
+let Sentry;
 let settings = {};
 let buildEnv = {};
 
@@ -49,7 +50,7 @@ async function ensureSingleInstance() {
         const url = Process.argv.at(-1);
         console.info("Sending open-url data to primary Sauce instance:", url);
         app.requestSingleInstanceLock({type: 'open-url', url});
-        app.quit(0);
+        app.quit();
         return false;
     }
     const {response} = await dialog.showMessageBox({
@@ -60,7 +61,7 @@ async function ensureSingleInstance() {
     });
     if (response === 0) {
         console.debug("User quitting due to existing instance");
-        app.quit(0);
+        app.quit();
         return false;
     }
     let hasLock = app.requestSingleInstanceLock({type: 'quit'});
@@ -75,7 +76,7 @@ async function ensureSingleInstance() {
         'Existing Sauce process hung',
         'Consider using Activity Monitor (mac) or Task Manager (windows) to find ' +
         'and stop any existing Sauce processes');
-    app.quit(1);
+    app.exit(1);
     return false;
 }
 
@@ -119,30 +120,15 @@ async function checkMacOSInstall() {
 
 
 async function initSentry(logEmitter) {
-    if (!settings.errorReporting || !app.isPackaged || !buildEnv.sentry_dsn) {
+    if (!settings.errorReporting || !buildEnv.sentry_dsn ||
+        (!app.isPackaged && !Process.env.FORCE_ENABLE_SENTRY)) {
         return;
     }
-    const Sentry = require('@sentry/node');
-    const Report = await import('../shared/report.mjs');
+    const [Sentry, Report] = await Promise.all([
+        import('../deps/src/sentry.mjs'),
+        import('../shared/report.mjs')
+    ]);
     Report.setSentry(Sentry);
-    const skipIntegrations = new Set(['OnUncaughtException', 'Console']);
-    Sentry.init({
-        dsn: buildEnv.sentry_dsn,
-        // Sentry changes the uncaught exc behavior to exit the process.  I think it may
-        // be fixed in newer versions though.
-        integrations: data => data.filter(x => !skipIntegrations.has(x.name)),
-        beforeSend: Report.beforeSentrySend,
-        sampleRate: 0.3,
-        release: `sauce4zwift@${Package.version}`,
-    });
-    Process.on('uncaughtException', Report.errorThrottled);
-    Sentry.setTag('version', Package.version);
-    Sentry.setTag('git_commit', buildEnv.git_commit);
-    // Leave some state for our beforeSendFilter that can customize reported events. (see report.mjs)
-    Sentry._sauceSpecialState = {
-        startClock: Date.now(),
-        startTimer: performance.now(),
-    };
     let id = settings.sentryId;
     if (!id) {
         const crypto = require('node:crypto');
@@ -150,13 +136,37 @@ async function initSentry(logEmitter) {
         settings.sentryId = id;
         saveSettings(settings);
     }
-    Sentry.setUser({id});
-    Sentry.setContext('os', {
-        machine: OS.machine(),
-        platform: OS.platform(),
-        release: OS.release(),
+    Report.setSentryCommonConfig({
+        dsn: buildEnv.sentry_dsn,
+        release: `sauce4zwift@${Package.version}`,
+        initialScope: {
+            user: {id},
+            tags: {
+                git_commit: buildEnv.git_commit,
+            }
+        },
     });
-    app.on('before-quit', () => Sentry.flush());
+    const skipIntegrations = new Set(['OnUncaughtException', 'Console']);
+    Sentry.initWithoutDefaultIntegrations({
+        ...Report.getSentryCommonConfig(),
+        sampleRate: 0.5,
+        maxBreadcrumbs: 200,
+        normalizeDepth: 10,
+        sendClientEvents: false,
+        integrations: Sentry.getDefaultIntegrationsWithoutPerformance()
+            .filter(x => !skipIntegrations.has(x.name)),
+        beforeSend: Report.beforeSentrySend,
+    });
+    console.warn(Sentry.getDefaultIntegrationsWithoutPerformance());
+    Process.on('uncaughtException', Report.errorThrottled);
+    app.on('before-quit', () => {
+        // Avoid side effects during quit..
+        try {
+            Sentry.flush();
+        } catch(e) {
+            console.error('Sentry flush problem:', e);
+        }
+    });
     logEmitter.on('message', ({message, level}) => {
         Sentry.addBreadcrumb({
             category: 'log',
@@ -164,11 +174,12 @@ async function initSentry(logEmitter) {
             message,
         });
     });
-    return id;
+    return Sentry;
 }
 
 
-async function startNormal() {
+function earlyElectronInit() {
+    // Routines that has to (or should) happen before the app "ready" state..
     initSettings();
     const logsPath = Path.join(app.getPath('documents'), 'Sauce', 'logs');
     app.setAppLogsPath(logsPath);
@@ -177,14 +188,6 @@ async function startNormal() {
     // Use non-electron naming for windows updater.
     // https://github.com/electron-userland/electron-builder/issues/2700
     app.setAppUserModelId('io.saucellc.sauce4zwift'); // must match build.appId for windows
-
-    // If we are forced to update to 114+ we'll have to switch our scrollbars to this...
-    // EDIT 2024-02  Maybe not, but it could look nicer in places where we will now require
-    // a visible scrollbar on windows and linux.  Last I looked it was kind of buggy though
-    // so we have to retest everything before using.
-    // EDIT 2024-03  We have reworked to support normal scrollbars but this still might look
-    // better.
-    //app.commandLine.appendSwitch('enable-features', 'OverlayScrollbar');
     if (settings.gpuEnabled === undefined) {
         settings.gpuEnabled = settings.forceEnableGPU == null ?
             OS.platform() !== 'win32' : settings.forceEnableGPU;
@@ -195,13 +198,31 @@ async function startNormal() {
         app.commandLine.appendSwitch('disable-gpu-compositing');
     }
     app.commandLine.appendSwitch('force-gpu-mem-available-mb', '1024');
-    // Fix audio playback of all things...
-    // By calling protocol.handle on file: we reset it's privs.
+    // Fix audio playback (retain stream priv)..
     protocol.registerSchemesAsPrivileged([{
         scheme: 'file',
         privileges: {stream: true}
     }]);
-    const sentryAnonId = await initSentry(logMeta.logEmitter);
+    return {logMeta};
+}
+
+
+async function startNormal() {
+    const {logMeta} = earlyElectronInit();
+    Sentry = await initSentry(logMeta.logEmitter);
+    if (!Sentry) {
+        if (app.isPackaged) {
+            // Electron already logs promise rejections but the output is verbose and tawdry.
+            Process.on('unhandledRejection', e => void console.error("Uncaught Exception:", e));
+            // Electron will stall the JS runtime with a sync dialog on errors if we don't handle it too.
+            Process.on('uncaughtException', e => void console.error("Uncaught Exception:", e));
+        } else {
+            // We get a nice error log for unhandledRejection but the electron error dialog eats
+            // log output for uncaughtException.  To retain debugger catching, we need to use the
+            // side effect free Monitor event.
+            Process.on('uncaughtExceptionMonitor', e => void console.error('Uncaught Exception:', e));
+        }
+    }
     await app.whenReady();
     if (await ensureSingleInstance() === false) {
         return;
@@ -212,7 +233,6 @@ async function startNormal() {
     const main = await import('./main.mjs');
     try {
         await main.main({
-            sentryAnonId,
             ...logMeta,
             loaderSettings: settings,
             saveLoaderSettings: saveSettings,
@@ -261,7 +281,11 @@ if (Process.argv.includes('--headless')) {
 } else {
     startNormal().catch(async e => {
         console.error('Runtime error:', e.stack);
-        await dialog.showErrorBox('Runtime error', e.stack);
+        dialog.showErrorBox('Runtime error', e.stack);
+        if (Sentry) {
+            Sentry.captureException(e);
+            await Sentry.flush();
+        }
         app.exit(1);
     });
 }

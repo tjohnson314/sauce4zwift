@@ -827,7 +827,7 @@ async function createLineChart(el, sectionId, settings, renderer) {
         const width = el.clientWidth;
         if (width) {
             const em = Number(getComputedStyle(el).fontSize.slice(0, -2));
-            dataPointsLen = settings.dataPoints || Math.ceil(width);
+            dataPointsLen = Math.min(40000, settings.dataPoints || Math.ceil(width));
             if (streamsCache && streamsCache.time.length < dataPointsLen) {
                 const nulls = Array.from(Sauce.data.range(dataPointsLen - streamsCache.time.length))
                     .map(x => null);
@@ -1310,7 +1310,12 @@ async function initScreenSettings() {
             }, {once: true});
             d.showModal();
         } else if (action === 'delete') {
-            screen.sections.splice(screen.sections.findIndex(x => x.id === sectionId), 1);
+            const toDel = screen.sections.find(x => x.id === sectionId);
+            if (!toDel) {
+                console.error("Delete action requested for non-existent section:", sectionId);
+                throw new Error('Invalid Section');
+            }
+            screen.sections.splice(screen.sections.indexOf(toDel), 1);
             Common.settingsStore.set(null, settings);
             renderScreen();
         } else {

@@ -155,8 +155,9 @@ function getSelectionStats() {
     const end = streams.time.indexOf(powerRoll.lastTime({noPad: true})) + 1;
     const distStream = streams.distance.slice(start, end);
     const altStream = streams.altitude.slice(start, end);
-    const hrStream = streams.hr.slice(start, end).filter(x => x);
-    const cadenceStream = streams.cadence.slice(start, end).filter(x => x);
+    const hrStream = streams.hr.slice(start, end);
+    const hrStreamFiltered = hrStream.filter(x => x && x > 10);
+    const cadenceStreamFiltered = streams.cadence.slice(start, end).filter(x => x);
     const wbalStream = streams.wbal.slice(start, end);
     const draftStream = streams.draft.slice(start, end);
     const speedStream = streams.speed.slice(start, end);
@@ -190,17 +191,17 @@ function getSelectionStats() {
             grade: (altStream[altStream.length - 1] - altStream[0]) / distance,
             vam: elapsedTime >= minVAMTime ? (gain / elapsedTime) * 3600 : 0,
         },
-        hr: hrStream.length ? {
-            avg: Sauce.data.avg(hrStream),
-            max: Sauce.data.max(hrStream),
+        hr: hrStreamFiltered.length ? {
+            avg: Sauce.data.avg(hrStreamFiltered),
+            max: Sauce.data.max(hrStreamFiltered),
         } : null,
-        speed: hrStream.length ? {
+        speed: speedStream.length ? {
             avg: (distance / activeTime) * 3.6,
             max: Sauce.data.max(speedStream),
         } : null,
-        cadence: cadenceStream.length ? {
-            avg: Sauce.data.avg(cadenceStream),
-            max: Sauce.data.max(cadenceStream),
+        cadence: cadenceStreamFiltered.length ? {
+            avg: Sauce.data.avg(cadenceStreamFiltered),
+            max: Sauce.data.max(cadenceStreamFiltered),
         } : null,
         wbal: wbalStream.length ? {
             avg: Sauce.data.avg(wbalStream),
@@ -488,7 +489,7 @@ function createStreamStackCharts(el) {
                 for (let i = 0; i < data.length; i++) {
                     const intensity = data[i][1] / athlete.ftp;
                     for (let j = 0; j < normZones.length; j++) {
-                        const z = powerZones[j];
+                        const z = normZones[j];
                         if (intensity <= z.to || z.to == null) {
                             if (zone !== z) {
                                 if (zone) {
@@ -509,8 +510,10 @@ function createStreamStackCharts(el) {
                         }
                     }
                 }
-                const s = powerSegments[segCount - 1];
-                s.width = data[data.length - 1][0] - s.x;
+                if (segCount) {
+                    const s = powerSegments[segCount - 1];
+                    s.width = data[data.length - 1][0] - s.x;
+                }
                 powerSegments.length = segCount;
                 chart.setSegments(powerSegments.concat(baseSegments), {render: false});
             } else {
@@ -615,6 +618,7 @@ function createTimeInPowerZonesPie(el) {
 
 function valueGradient(color, value) {
     const shadeColor = SC.color.parse(color).adjustLight(0.2).adjustSaturation(-0.2).toString({rgb:true});
+    value ||= 0;
     return {
         type: 'linear',
         x: 1,
@@ -678,7 +682,10 @@ function createPackTimeChart(el) {
                 selectionEntry.eventSubgroup?.name || 'Event';
             const max = 24;
             if (name.length > max) {
-                name = `<span title="${Common.sanitizeAttr(name)}">${name.substr(0, max - 1)}...</span>`;
+                name = `<span title="${Common.sanitizeAttr(name)}">${Common.sanitize(
+                    name.substr(0, max - 1))}...</span>`;
+            } else {
+                name = Common.sanitize(name);
             }
             subTitle = `<br/>${name}`;
         } else if (selectionSource === 'laps') {
@@ -708,21 +715,21 @@ function createPackTimeChart(el) {
                 itemStyle: {borderRadius: [2, 0, 0, 2]},
                 data: [{
                     name: 'Following',
-                    value: data.followTime / totalTime,
-                    itemStyle: {color: valueGradient('#65a354', powers[0] / maxPower)},
+                    value: totalTime ? data.followTime / totalTime : 1/3,
+                    itemStyle: {color: valueGradient('#65a354', maxPower ? powers[0] / maxPower : 0)},
                 }],
             }, {
                 data: [{
                     name: 'Solo',
-                    value: data.soloTime / totalTime,
-                    itemStyle: {color: valueGradient('#d1c209', powers[1] / maxPower)},
+                    value: totalTime ? data.soloTime / totalTime : 1/3,
+                    itemStyle: {color: valueGradient('#d1c209', maxPower ? powers[1] / maxPower : 0)},
                 }],
             }, {
                 itemStyle: {borderRadius: [0, 2, 2, 0]},
                 data: [{
                     name: 'Working',
-                    value: data.workTime / totalTime,
-                    itemStyle: {color: valueGradient('#ca3805', powers[2] / maxPower)},
+                    value: totalTime ? data.workTime / totalTime : 1/3,
+                    itemStyle: {color: valueGradient('#ca3805', maxPower ? powers[2] / maxPower: 0)},
                 }],
             }],
         });

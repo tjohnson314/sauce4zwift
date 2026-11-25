@@ -41,11 +41,9 @@ const gaugeConfigs = {
             max: 700,
         },
         defaultColor: '#35e',
-        getValue: x => settings.dataSmoothing ? x.stats.power.smooth[settings.dataSmoothing] : x.state.power,
-        getAvgValue: x =>
-            (settings.currentLap ? x.stats.laps.at(-1).power : x.stats.power).avg,
-        getMaxValue: x =>
-            (settings.currentLap ? x.stats.laps.at(-1).power : x.stats.power).max,
+        getValue: x => settings.dataSmoothing ?
+            x.stats.power.smooth[settings.dataSmoothing] :
+            x.state?.power,
         getLabel: H.number,
         detailFormatter: x => `{value|${H.power(x)}}\n{unit|watts}`,
         axisColorBands: data => {
@@ -85,7 +83,9 @@ const gaugeConfigs = {
             min: 70,
             max: 190,
         },
-        getValue: x => settings.dataSmoothing ? x.stats.hr.smooth[settings.dataSmoothing] : x.state.heartrate,
+        getValue: x => settings.dataSmoothing ?
+            x.stats.hr.smooth[settings.dataSmoothing] :
+            x.state?.heartrate,
         getLabel: H.number,
         detailFormatter: x => `{value|${H.number(x)}}\n{unit|bpm}`,
         longPeriods: true,
@@ -98,7 +98,9 @@ const gaugeConfigs = {
             min: 0,
             max: 100,
         },
-        getValue: x => settings.dataSmoothing ? x.stats.speed.smooth[settings.dataSmoothing] : x.state.speed,
+        getValue: x => settings.dataSmoothing ?
+            x.stats.speed.smooth[settings.dataSmoothing] :
+            x.state?.speed,
         getLabel: x => H.pace(x, {precision: 0, sport}),
         detailFormatter: x => {
             const unit = sport === 'running' ?
@@ -116,7 +118,7 @@ const gaugeConfigs = {
             min: 40,
             max: 140,
         },
-        getValue: x => x.state.cadence,
+        getValue: x => x.state?.cadence,
         getLabel: H.number,
         detailFormatter: x => `{value|${H.number(x)}}\n{unit|rpm}`,
         longPeriods: true,
@@ -129,7 +131,7 @@ const gaugeConfigs = {
             min: 0,
             max: 300,
         },
-        getValue: x => settings.dataSmoothing ? x.stats.draft.smooth[settings.dataSmoothing] : x.state.draft,
+        getValue: x => settings.dataSmoothing ? x.stats.draft.smooth[settings.dataSmoothing] : x.state?.draft,
         getLabel: H.number,
         detailFormatter: x => `{value|${H.number(x)}}\n{unit|w savings}`,
         longPeriods: true,
@@ -396,7 +398,7 @@ export async function main() {
         reanimateTimeout = setTimeout(() => gauge.setOption({series: [{animation: true}]}), 400);
     });
     Common.subscribe('athlete/watching', watching => {
-        sport = watching.state.sport;
+        sport = watching.state?.sport || 'cycling';
         if (type === 'pace') {
             config.name = sport === 'running' ? 'Pace' : 'Speed';
         }

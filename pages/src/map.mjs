@@ -326,12 +326,14 @@ export class MapAthlete extends MapEntity {
             name = `${athlete.fLast}`;
         } else if (this.chats.length) {
             const c = this.chats[0][0];
-            name = `${c.firstName[0]}.${c.lastName}`;
+            name = `${c.firstName?.[0] || '-'}.${c.lastName || '-'}`;
         } else {
             name = `ID: ${this.id}`;
         }
         const avatar = athlete?.avatar ?
-            `<avatar-pad></avatar-pad><img class="avatar" src="${athlete.avatar}"/>` : '';
+            `<avatar-pad></avatar-pad><img class="avatar"
+                                           src="${Common.sanitizeAttr(athlete.avatar)}"/>` :
+            '';
         return `<a class="name" href="/pages/profile.html?id=${this.id}&windowType=profile"
                    target="profile_popup_${this.id}">${Common.sanitize(name)}${avatar}</a>`;
     }
@@ -362,7 +364,8 @@ export class MapAthlete extends MapEntity {
             if (html.length) {
                 html.push('<br/>');
             }
-            html.push(`<q class="chat">${this.chats.map(x => x[0].message).join('<br/>')}</q>`);
+            html.push(`<q class="chat">${this.chats.map(x =>
+                Common.sanitize(x[0].message)).join('<br/>')}</q>`);
         }
         return html.length ? html.join('') : '';
     }
@@ -1261,7 +1264,17 @@ export class SauceZwiftMap extends EventTarget {
             const {fullImg, finalImg} = await this._getMapBackgroundImages(courseId);
             let roads, segments;
             if (isPortal) {
-                const road = await Common.getRoad('portal', portalRoad);
+                let road = await Common.getRoad('portal', portalRoad);
+                if (!road) {
+                    console.error("Portal road unavailable:", portalRoad);
+                    const fakePath = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+                    road = {
+                        id: portalRoad,
+                        sports: [],
+                        path: fakePath,
+                        curvePath: new Curves.catmullRomPath(fakePath),
+                    };
+                }
                 roads = [road];
                 segments = [];
             } else {
@@ -1574,7 +1587,6 @@ export class SauceZwiftMap extends EventTarget {
         const road = this._roads.find(x => x.id === id);
         if (!road) {
             console.error('Road ID not found:', id);
-            this.roadId = null;
             return;
         }
         const path = road.curvePath;

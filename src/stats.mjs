@@ -1,7 +1,9 @@
+import Assert from 'node:assert';
 import Events from 'node:events';
 import Path from 'node:path';
 import {createRequire} from 'node:module';
 import {SqliteDatabase, deleteDatabase} from './db.mjs';
+import {sleep, schedule} from './sleep.mjs';
 import * as Sauce from '../shared/sauce/index.mjs';
 import * as Report from '../shared/report.mjs';
 import * as Zwift from './zwift.mjs';
@@ -711,7 +713,8 @@ class QueryReductionEmitter {
     createFilterGroups(batch) {
         // Naive reference impl: A unique filter for every single listener
         return batch.listeners.map(listener => ({
-            filterData: data => structuredClone(data),
+            filterMany: datas => structuredClone(datas),
+            filter: data => structuredClone(data),
             listeners: [listener],
         }));
     }
@@ -720,34 +723,54 @@ class QueryReductionEmitter {
         return data;
     }
 
-    emit(event, getter, formatter) {
+    _emit(event, getter, formatter, {many}={}) {
         const ctx = this._contexts.get(event);
         if (!ctx) {
             return;
         }
+        const filterFunc = many ? 'filterMany' : 'filter';
+        const listenerDataMap = new Map();  // preserve listener order
         for (let sIdx = 0; sIdx < ctx.strategy.length; sIdx++) {
             const {query: stratQuery, filterGroups} = ctx.strategy[sIdx];
             const superData = getter(stratQuery);
             for (let fIdx = 0; fIdx < filterGroups.length; fIdx++) {
-                const {filterData, listeners} = filterGroups[fIdx];
-                const data = filterData ? filterData(superData) : superData;
-                if (formatter) {
-                    for (let i = 0; i < listeners.length; i++) {
-                        const {callback, query} = listeners[i];
-                        callback(formatter(data, query));
-                    }
-                } else {
-                    for (let i = 0; i < listeners.length; i++) {
-                        listeners[i].callback(data);
-                    }
+                const {[filterFunc]: filter, listeners} = filterGroups[fIdx];
+                const data = filter ? filter(superData) : superData;
+                for (let i = 0; i < listeners.length; i++) {
+                    Assert.ok(!listenerDataMap.has(listeners[i])); // TMP
+                    listenerDataMap.set(listeners[i], data);
                 }
             }
         }
+        Assert.strictEqual(listenerDataMap.size, ctx.listeners.length);
+        if (formatter) {
+            for (let i = 0; i < ctx.listeners.length; i++) {
+                const x = ctx.listeners[i];
+                Assert.ok(listenerDataMap.has(x)); // TMP
+                const data = listenerDataMap.get(x);
+                x.callback(formatter(data, x.query));
+            }
+        } else {
+            for (let i = 0; i < ctx.listeners.length; i++) {
+                const x = ctx.listeners[i];
+                Assert.ok(listenerDataMap.has(x)); // TMP
+                const data = listenerDataMap.get(x);
+                x.callback(data);
+            }
+        }
+    }
+
+    emit(event, getter, formatter) {
+        return this._emit(event, getter, formatter);
+    }
+
+    emitMany(event, getter, formatter) {
+        return this._emit(event, getter, formatter, {many: true});
     }
 }
 
 
-class ADV2QueryReductionEmitter extends QueryReductionEmitter {
+export class ADV2QueryReductionEmitter extends QueryReductionEmitter {
     createQueryStrategies(ctx) {
         const strategies = [];
         const nonStatsResources = new Set(ctx.listeners
@@ -795,19 +818,19 @@ class ADV2QueryReductionEmitter extends QueryReductionEmitter {
 
     createFilterGroups(batch) {
         const groups = new Map();
+        const batchResources = new Set(batch.query.resources);
         for (const x of batch.listeners) {
-            const mask = Array.from(new Set(batch.query.resources)
-                .difference(new Set(x.query.resources)));
+            const mask = Array.from(batchResources.difference(new Set(x.query.resources)));
             const statsMask = (!x.query.stats && batch.query.stats) ?
                 x.query.resources.filter(x => ['laps', 'segments', 'events'].includes(x)) :
                 null;
             const sig = JSON.stringify([mask, statsMask]);
             if (!groups.has(sig)) {
-                let filterData;
+                let filterMany, filter;
                 if (mask.length || statsMask) {
                     const maskObj = mask.length ? Object.fromEntries(mask.map(x => [x, undefined])) : {};
                     if (statsMask) {
-                        filterData = data => {
+                        filterMany = data => {
                             const clone = new Array(data.length);
                             for (let i = 0; i < data.length; i++) {
                                 const x = {...data[i], ...maskObj};
@@ -819,19 +842,29 @@ class ADV2QueryReductionEmitter extends QueryReductionEmitter {
                             }
                             return clone;
                         };
+                        filter = data => {
+                            const clone = {...data, ...maskObj};
+                            for (let i = 0; i < statsMask.length; i++) {
+                                const key = statsMask[i];
+                                clone[key] = clone[key].map(x => ({...x, stats: undefined}));
+                            }
+                            return clone;
+                        };
                     } else {
-                        filterData = data => {
+                        filterMany = data => {
                             const clone = new Array(data.length);
                             for (let i = 0; i < data.length; i++) {
                                 clone[i] = {...data[i], ...maskObj};
                             }
                             return clone;
                         };
+                        filter = data => ({...data, ...maskObj});
                     }
                 }
                 groups.set(sig, {
                     listeners: [],
-                    filterData,
+                    filterMany,
+                    filter,
                 });
             }
             groups.get(sig).listeners.push(x);
@@ -875,7 +908,8 @@ export class StatsProcessor extends Events.EventEmitter {
         this._followerIds = new Set();
         this._pendingEgressStates = new Map();
         this._lastEgressStates = 0;
-        this._timeoutEgressStates = null;
+        this._egressStatesSched = null;
+        this._gameEquipment = null;
         const app = options.app;
         this._googleMapTileKey = app.buildEnv?.google_map_tile_key;
         this._autoResetEvents = !!app.getSetting('autoResetEvents');
@@ -908,7 +942,6 @@ export class StatsProcessor extends Events.EventEmitter {
             gc.on('game-session', this.onGameSession.bind(this));
             gc.on('powerup-set', this.onPowerupSet.bind(this));
             gc.on('powerup-activate', this.onPowerupActivate.bind(this));
-            gc.on('powerup-deactivate', this.onPowerupDeactivate.bind(this));
             gc.on('powerup-clear', this.onPowerupClear.bind(this));
             gc.on('social-action', this.onGameConnectionSocialAction.bind(this));
         }
@@ -933,12 +966,11 @@ export class StatsProcessor extends Events.EventEmitter {
         if (!cEventName) {
             return;
         }
-        const query = {
+        this._adV2Emitter.on(cEventName, callback, {
             stats: !!options.stats,
             resources: options.resources?.toSorted() || [],
             sourceEvent: event,
-        };
-        this._adV2Emitter.on(cEventName, callback, query);
+        });
     }
 
     onUnsubscribe(event, callback, options) {
@@ -1213,6 +1245,30 @@ export class StatsProcessor extends Events.EventEmitter {
         return await this.zwiftAPI.getQueue();
     }
 
+    async getOnlinePacerBots() {
+        const worldList = await this.zwiftAPI.getDropInWorldList();
+        return worldList
+            .filter(x => x.realm === 1 && x.pacerBots?.length)
+            .map(x => x.pacerBots.map(xx => ({
+                ...xx,
+                courseId: x.courseId,
+                portal: x.courseId >= 10000,
+            })))
+            .flat();
+    }
+
+    async getOnlineFollowingAthletes() {
+        const worldList = await this.zwiftAPI.getDropInWorldList();
+        return worldList
+            .filter(x => x.realm === 1 && x.followees?.length)
+            .map(x => x.followees.map(xx => ({
+                ...xx,
+                courseId: x.courseId,
+                portal: x.courseId >= 10000,
+            })))
+            .flat();
+    }
+
     getZwiftConnectionInfo() {
         return this.gameMonitor.getConnectionInfo();
     }
@@ -1277,45 +1333,48 @@ export class StatsProcessor extends Events.EventEmitter {
     }
 
     onPowerupActivate(details) {
-        console.info('PowerUp activate:', details.powerUpType, details.powerUpTimer, 'seconds');
-        const end = Date.now() + details.powerUpTimer * 1000;
-        const seqno = this._gameState.availablePowerUpSeqno;
-        this._updateGameState({
-            availablePowerUp: null,
-            availablePowerUpSeqno: null,
-            activePowerUp: details.powerUpType,
-            activePowerUpEnd: end,
-            activePowerUpSeqno: seqno,
-        });
-        // Because the game connection can get partitioned at any point, and I don't
-        // fully trust the game to reliably clear our powerup states for us, setup a
-        // cleanup routine..
-        if (seqno != null) {
-            setTimeout(() => {
-                if (this._gameState.activePowerUpSeqno === seqno) {
-                    console.warn("Internal cleanup of active powerup state was required");
-                    this.onPowerupDeactivate();
-                }
-            }, details.powerUpTimer * 1000 + 1000);
+        if (details.powerUpTimer) {
+            console.info('PowerUp activate:', details.powerUpType, details.powerUpTimer, 'seconds');
+            const end = Date.now() + details.powerUpTimer * 1000;
+            const seqno = this._gameState.availablePowerUpSeqno;
+            this._updateGameState({
+                availablePowerUp: null,
+                availablePowerUpSeqno: null,
+                activePowerUp: details.powerUpType,
+                activePowerUpEnd: end,
+                activePowerUpSeqno: seqno,
+            });
+            // Because the game connection can get partitioned at any point, and I don't
+            // fully trust the game to reliably clear our powerup states for us, setup a
+            // cleanup routine..
+            if (seqno != null) {
+                schedule(() => {
+                    if (this._gameState.activePowerUpSeqno === seqno) {
+                        console.warn("Internal cleanup of active powerup state was required");
+                        this.onPowerupClear();
+                    }
+                }, details.powerUpTimer * 1000 + 1000);
+            } else {
+                console.error("Internal powerup state machine error:", 'seqno unset');
+            }
         } else {
-            console.error("Internal powerup state machine error:", 'seqno unset');
+            console.info(`PowerUp tossed:`, details.powerUpType);
+            this._updateGameState({
+                availablePowerUp: null,
+                availablePowerUpSeqno: null,
+                activePowerUp: null,
+                activePowerUpEnd: null,
+                activePowerUpSeqno: null,
+            });
         }
-    }
-
-    onPowerupDeactivate() {
-        console.info('PowerUp deactivate:', this._gameState.powerUpType);
-        this._updateGameState({
-            activePowerUp: null,
-            activePowerUpEnd: null,
-            activePowerUpSeqno: null,
-        });
     }
 
     onPowerupClear() {
         console.debug('PowerUp cleared');
         this._updateGameState({
-            availablePowerUp: null,
-            availablePowerUpSeqno: null
+            activePowerUp: null,
+            activePowerUpEnd: null,
+            activePowerUpSeqno: null,
         });
     }
 
@@ -1510,7 +1569,7 @@ export class StatsProcessor extends Events.EventEmitter {
                     // We have no idea actually, probably an event in another world.. just be generous
                     pending = true;
                     tentativeRank = Infinity;
-                } else if (ad.eventSubgroup.id === id) {
+                } else if (ad.eventSubgroup?.id === id) {
                     pending = true;
                     tentativeRank = ad.eventPosition;
                 }
@@ -1830,7 +1889,7 @@ export class StatsProcessor extends Events.EventEmitter {
                 if (bucket.pending) {
                     throw new Error("Internal Error");
                 }
-                bucket.pending = Sauce.sleep(throttleFor).then(() => bucket.pending = null);
+                bucket.pending = sleep(throttleFor).then(() => bucket.pending = null);
             }
             return await c.promise;
         } else {
@@ -1921,9 +1980,9 @@ export class StatsProcessor extends Events.EventEmitter {
                     throw new Error("Internal Error");
                 }
                 const now = monotonic();
-                bucket.pending = p.finally(() =>
-                    Sauce.sleep(throttleFor - (monotonic() - now)).then(() =>
-                        bucket.pending = null));
+                bucket.pending = p
+                    .finally(() => sleep(Math.max(0, throttleFor - (monotonic() - now)))
+                        .then(() => bucket.pending = null));
                 await p;
             }
             // TBD: Are we going to need bin search here too?
@@ -1998,11 +2057,12 @@ export class StatsProcessor extends Events.EventEmitter {
     }
 
     getNearbyData() {
-        return this._mostRecentNearby;
+        const now = monotonic();
+        return this._mostRecentNearby.map(x => this._formatAthleteData(x, now));
     }
 
     getGroupsData() {
-        return this._mostRecentGroups;
+        return this._formatGroupsWithFormattedNearby(this._mostRecentGroups, this.getNearbyData());
     }
 
     startLap() {
@@ -2218,7 +2278,7 @@ export class StatsProcessor extends Events.EventEmitter {
             ftp: p.ftp,
             type: p.playerType,
             countryCode: p.countryCode, // iso 3166
-            avatar: !minor ? p.imageSrcLarge || p.imageSrc : undefined,
+            avatar: !minor ? p.imageSrc : undefined,
             weight: !minor && p.weight ? p.weight / 1000 : undefined,
             height: !minor && p.height ? p.height / 10 : undefined,
             gender: !minor && p.male === false ? 'female' : 'male',
@@ -2239,6 +2299,31 @@ export class StatsProcessor extends Events.EventEmitter {
             o.following = p.socialFacts.followerStatusOfLoggedInPlayer === 'IS_FOLLOWING';
             o.followRequest = p.socialFacts.followerStatusOfLoggedInPlayer === 'REQUESTS_TO_FOLLOW';
             o.favorite = !!p.socialFacts.isFavoriteOfLoggedInPlayer;
+        }
+        if (this._gameEquipment) {
+            if (!o.equipment) {
+                o.equipment = {};
+            }
+            if (p.bikeFrameType != null) {
+                o.equipment.cycling = {
+                    frame: this._gameEquipment.bikeFrames.get(p.bikeFrameType),
+                    wheelFront: this._gameEquipment.bikeFrontWheels.get(p.bikeWheelFrontType),
+                    wheelRear: this._gameEquipment.bikeRearWheels.get(p.bikeWheelRearType),
+                };
+                // XXX testing
+                if (p.bikeFrameType && !o.equipment.cycling.frame) debugger;
+                if (p.bikeWheelFrontType && !o.equipment.cycling.wheelFront) debugger;
+                if (p.bikeWheelRearType && !o.equipment.cycling.wheelRear) debugger;
+            }
+            if (p.runShoesType != null) {
+                o.equipment.running = {
+                    shoes: this._gameEquipment.runShoes.get(p.runShoesType),
+                };
+                // XXX testing
+                if (p.runShoesType && !o.equipment.running.shoes) {
+                    console.warn("missing shoe:", p.runShoesType);
+                }
+            }
         }
         return o;
     }
@@ -2391,7 +2476,7 @@ export class StatsProcessor extends Events.EventEmitter {
         return athlete && this._applyAthletePrivacyFilter(athlete, ad || this._athleteData.get(athlete.id));
     }
 
-    async getAthlete(ident, {refresh, noWait, allowFetch}={}) {
+    async getAthlete(ident, {refresh, noWait, allowFetch, required}={}) {
         const id = this._realAthleteId(ident);
         let athlete = this._loadAthlete(id);
         if (allowFetch && !athlete) {
@@ -2399,7 +2484,7 @@ export class StatsProcessor extends Events.EventEmitter {
             noWait = false;
         }
         if (refresh && this.zwiftAPI.isAuthenticated()) {
-            const updating = this.zwiftAPI.getProfile(id).then(p => p ?
+            const updating = this.zwiftAPI.getProfile(id, {required}).then(p => p ?
                 this.updateAthlete(id, this._profileToAthlete(p)) :
                 undefined);
             if (!noWait) {
@@ -2558,14 +2643,14 @@ export class StatsProcessor extends Events.EventEmitter {
     }
 
     _schedStatesEmit() {
-        if (this._pendingEgressStates.size && !this._timeoutEgressStates) {
+        if (this._pendingEgressStates.size && !this._egressStatesSched) {
             const delay = Math.max(0, this._emitStatesMinRefresh - (monotonic() - this._lastEgressStates));
-            this._timeoutEgressStates = setTimeout(() => this._flushPendingEgressStates(), delay);
+            this._egressStatesSched = schedule(() => this._flushPendingEgressStates(), delay);
         }
     }
 
     _flushPendingEgressStates() {
-        this._timeoutEgressStates = null;
+        this._egressStatesSched = null;
         const states = new Array(this._pendingEgressStates.size);
         let i = 0;
         for (const x of this._pendingEgressStates.values()) {
@@ -2603,7 +2688,7 @@ export class StatsProcessor extends Events.EventEmitter {
             const x = this._chatHistory[i];
             if (x.from === action.athleteId) {
                 if (Math.abs(x.ts - ts) < 2000 && x.message === action.message) {
-                    console.debug("Deduping chat message:", ts, action.athleteId, action.message);
+                    //console.debug("Deduping chat message:", ts, action.athleteId, action.message);
                     return;
                 }
                 break;
@@ -2854,7 +2939,7 @@ export class StatsProcessor extends Events.EventEmitter {
                 }
                 this._profileFetchBackoff *= 1.5;
             }
-            await Sauce.sleep(this._profileFetchBackoff);
+            await sleep(this._profileFetchBackoff);
         }
     }
 
@@ -2953,7 +3038,8 @@ export class StatsProcessor extends Events.EventEmitter {
             s.incomplete = true;
         }
         ad.activeSegments.clear();
-        if (ad.eventSubgroup) {
+        const curEventSlice = ad.eventSlices.at(-1);
+        if (curEventSlice && curEventSlice.end == null) {
             this.triggerEventEnd(ad);
         }
         this._clearAthleteEvent(ad);
@@ -3017,7 +3103,8 @@ export class StatsProcessor extends Events.EventEmitter {
                 // in env.mjs we normalize the z values so they match the player state z (roughly).
                 state.altitude = state.z / 100 * slopeScale;
             } else {
-                state.altitude = (state.z - worldMeta.seaLevel + elOffset) / 100 * slopeScale;
+                state.altitude = (state.z - worldMeta.seaLevel + (worldMeta.eleOffset || 0)) / 100 *
+                    slopeScale;
             }
         }
         const ad = this._athleteData.get(state.athleteId);
@@ -3606,6 +3693,7 @@ export class StatsProcessor extends Events.EventEmitter {
         this._statesJob = this._statesProcessor();
         this._gcInterval = setInterval(this._gcAthleteData.bind(this), 62768);
         this._staleDataCleanupInterval = setInterval(this._staleDataCleanup.bind(this), 7349);
+        this._fetchEquipment();  // bg okay
         if (this.gameMonitor) {
             this.gameMonitor.on('inPacket', this.onIncoming.bind(this));
             this.gameMonitor.on('watching-athlete', this.setWatching.bind(this));
@@ -3618,7 +3706,7 @@ export class StatsProcessor extends Events.EventEmitter {
             });
             this.gameMonitor.start();
             this._zwiftMetaRefresh = 10000;
-            this._zwiftMetaId = setTimeout(() => this._zwiftMetaSync(), 0);
+            queueMicrotask(() => this._zwiftMetaSync());
         }
         if (this._autoResetEvents) {
             console.info("Auto reset for events enabled");
@@ -3633,12 +3721,32 @@ export class StatsProcessor extends Events.EventEmitter {
     async stop() {
         this._active = false;
         clearInterval(this._gcInterval);
-        clearTimeout(this._zwiftMetaId);
+        this._zwiftMetaSyncSched?.cancel();
         this._gcInterval = null;
         try {
             await this._statesJob;
         } finally {
             this._nearybyJob = null;
+        }
+    }
+
+    async _fetchEquipment() {
+        this._gameEquipment = await this.zwiftAPI.getGameEquipment();
+        const overrides = Env.getEquipmentOverrides();
+        const allTypes = Object.keys(this._gameEquipment);
+        for (const x of overrides) {
+            let matched;
+            for (const k of allTypes) {
+                const equipment = this._gameEquipment[k];
+                const ptr = equipment.get(x.equipmentId);
+                if (ptr) {
+                    matched = true;
+                    equipment.set(x.overrideId, ptr);
+                }
+            }
+            if (!matched) {
+                console.warn("No mapping found for equipment override:", x);
+            }
         }
     }
 
@@ -3817,7 +3925,7 @@ export class StatsProcessor extends Events.EventEmitter {
             return;
         }
         this.__zwiftMetaSync().catch(e => {
-            if (e.message === 'fetch failed' || e.name === 'TimeoutError') {
+            if (e.message === 'fetch failed' || e.name === 'TimeoutError' || e.status >= 500) {
                 console.warn('Zwift Meta Sync network problem:', e.cause?.message || e);
             } else {
                 Report.errorThrottled(e);
@@ -3825,7 +3933,7 @@ export class StatsProcessor extends Events.EventEmitter {
         }).finally(() => {
             // The event feed APIs are horribly broken so we need to refresh more often
             // at startup to try and fill in the gaps.
-            this._zwiftMetaId = setTimeout(() => this._zwiftMetaSync(), this._zwiftMetaRefresh);
+            this._zwiftMetaSyncSched = schedule(() => this._zwiftMetaSync(), this._zwiftMetaRefresh);
             this._zwiftMetaRefresh = Math.min(10 * 60 * 1000, this._zwiftMetaRefresh * 1.25);
         });
     }
@@ -3867,7 +3975,7 @@ export class StatsProcessor extends Events.EventEmitter {
                 if (updates.length) {
                     this.saveAthletes(updates);
                 }
-                await Sauce.sleep(Math.min(1000, backoff *= 1.1));
+                await sleep(Math.min(1000, backoff *= 1.1));
             }
         });
         for (const x of absent) {
@@ -3891,7 +3999,7 @@ export class StatsProcessor extends Events.EventEmitter {
                 if (updates.length) {
                     this.saveAthletes(updates);
                 }
-                await Sauce.sleep(Math.min(1000, backoff *= 1.1));
+                await sleep(Math.min(1000, backoff *= 1.1));
             }
         });
         for (const x of absent) {
@@ -4192,7 +4300,7 @@ export class StatsProcessor extends Events.EventEmitter {
     }
 
     async _statesProcessor() {
-        const interval = 100;
+        const interval = 1000;
         // Align interval with realtime second boundary for aesthetics and to avoid potential
         // rounding issues in stats code or UX code.
         let target = (monotonic() / 1000 | 0) * 1000 + interval;
@@ -4221,11 +4329,11 @@ export class StatsProcessor extends Events.EventEmitter {
                         this.emit('groups', this._formatGroupsWithFormattedNearby(groups, nearbyFormatted));
                     }
                 }
-                this._adV2Emitter.emit('nearby/groups',
-                                       q => nearby.map(x => this._formatAthleteDataV2(x, q, now)),
-                                       (data, {sourceEvent}) => sourceEvent === 'groups/v2' ?
-                                           this._formatGroupsWithFormattedNearby(groups, data) :
-                                           data);
+                this._adV2Emitter.emitMany('nearby/groups',
+                                           q => nearby.map(x => this._formatAthleteDataV2(x, q, now)),
+                                           (data, {sourceEvent}) => sourceEvent === 'groups/v2' ?
+                                               this._formatGroupsWithFormattedNearby(groups, data) :
+                                               data);
             } catch(e) {
                 Report.errorThrottled(e);
                 target += errBackoff++ * interval;
@@ -4382,7 +4490,7 @@ export class StatsProcessor extends Events.EventEmitter {
                 data.lap = this._getBucketStatsV2(ad.lapSlices[ad.lapSlices.length - 1], ad, {athlete, now});
             }
             if (resources.includes('lastLap')) {
-                data.lap = ad.lapSlices.length > 1 ?
+                data.lastLap = ad.lapSlices.length > 1 ?
                     this._getBucketStatsV2(ad.lapSlices[ad.lapSlices.length - 2], ad, {athlete, now}) :
                     null;
             }

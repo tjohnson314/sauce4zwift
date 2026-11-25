@@ -25,7 +25,7 @@ endif
 
 
 $(PACKAGES): package.json
-	npm install
+	npm clean-install
 	echo "" > $@
 
 
@@ -85,6 +85,7 @@ publish-docker-linux-native:
 deps:
 	$(MAKE) -j 32 -C pages/deps
 	$(MAKE) -j 32 -C shared/deps
+	./tools/bin/bundle-sentry
 
 sass:
 	$(NPATH)/sass pages/scss:pages/css

@@ -1,5 +1,5 @@
 import * as Storage from './storage.mjs';
-import Sentry from '@sentry/node';
+import * as Report from '../shared/report.mjs';
 
 export class NonMember extends Error {}
 
@@ -32,7 +32,7 @@ export async function link(code, options={}) {
         });
     } catch(e) {
         if (!(e instanceof NonMember)) {
-            Sentry.captureException(e);
+            Report.error(e);
             throw e;
         }
         return false;
@@ -77,6 +77,9 @@ export async function getMembership(options={}) {
 
 export async function getLegacyMembership(token) {
     const r = await fetch('https://www.sauce.llc/patrons.json');
+    if (!r.ok) {
+        throw new Error('Failed to get patreon legacy membership: ' + r.status);
+    }
     const patrons = await r.json();
     if (patrons[token]) {
         return {

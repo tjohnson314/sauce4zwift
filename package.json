@@ -2,11 +2,11 @@
   "name": "sauce4zwift",
   "productName": "Sauce for Zwift™",
   "private": true,
-  "version": "2.3.0-alpha.2",
+  "version": "2.4.0-alpha.8",
   "description": "Overlay widgets and advanced instrumentation for the serious Zwifter",
   "homepage": "https://www.sauce.llc",
   "author": "Sauce, LLC",
-  "license": "UNLICENSED",
+  "license": "GPL-3.0-only",
   "main": "src/loader.js",
   "scripts": {
     "start": "electron .",
@@ -15,42 +15,45 @@
     "unpacked": "electron-builder --dir",
     "build": "electron-builder build -p never",
     "publish": "electron-builder build -p always",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "sh -c build/scripts/postinstall.sh",
     "test": "node --test",
     "test-debug": "node --inspect-brk --test"
   },
   "dependencies": {
-    "@sentry/node": "6.19.6",
-    "better-sqlite3": "12.10.0",
-    "electron-updater": "6.8.3",
-    "express": "4.22.1",
-    "ws": "8.20.0",
+    "@rgrove/parse-xml": "5.0.0",
+    "better-sqlite3": "13.0.3",
+    "electron-updater": "6.8.10",
+    "express": "5.3.0",
     "jsfit": "https://github.com/SauceLLC/jsfit/archive/c55550a6ad.tar.gz",
     "keytar": "7.9.0",
-    "node-stream-zip": "1.15.0",
-    "protobufjs": "7.5.6"
+    "node-stream-zip": "1.16.0",
+    "protobufjs": "7.6.6",
+    "ws": "8.22.0"
   },
   "optionalDependencies": {
     "macos-window-control": "https://github.com/mayfield/macos-window-control/archive/4882bd7bf06.tar.gz",
-    "zwift-utils": "https://github.com/SauceLLC/zwift-utils/archive/0d252bca1e2b1.tar.gz"
+    "zwift-utils": "https://github.com/SauceLLC/zwift-utils/archive/b7bcac101db93fc9761.tar.gz"
   },
   "devDependencies": {
     "@electron/notarize": "3.1.1",
-    "@sentry/browser": "6.19.6",
-    "echarts": "5.6.0",
-    "electron": "41.6.1",
-    "electron-builder": "26.8.1",
+    "@sentry/browser": "11.4.0",
+    "@sentry/node": "11.4.0",
+    "echarts": "6.1.0",
+    "electron": "43.8.7",
+    "electron-builder": "26.17.0",
+    "esbuild": "0.28.2",
     "eslint": "8.57.1",
     "eslint-plugin-html": "8.1.2",
-    "sass": "1.99.0",
+    "sass": "1.105.1",
     "saucecharts": "https://github.com/SauceLLC/saucecharts/archive/408e864e.tar.gz",
-    "world_countries_lists": "2.9.0"
+    "world_countries_lists": "3.3.0"
   },
   "build": {
     "appId": "io.saucellc.sauce4zwift",
     "artifactName": "sauce4zwift-${version}.${ext}",
     "buildDependenciesFromSource": true,
     "generateUpdatesFilesForAllChannels": true,
+    "afterSign": "build/scripts/notarize.js",
     "protocols": [
       {
         "name": "Sauce for Zwift",
@@ -93,18 +96,22 @@
       "!**/build/node_gyp_bins",
       "!**/{Release,Debug}/obj",
       "!**/{Release,Debug}/.forge-meta",
-      "!node_modules/keytar/{bin,node_modules}",
+      "!node_modules/keytar/node_modules",
       "!node_modules/better-sqlite3/{bin,deps,src}",
       "!node_modules/better-sqlite3/build/{Release,Debug}/{*.a,*.lib,test_extension.*}",
       "!node_modules/better-sqlite3/build/deps",
       "!node_modules/protobufjs/{scripts,dist}",
       "!node_modules/nan",
       "!node_modules/web-streams-polyfill",
-      "!node_modules/@sentry/**/{build,esm}",
       "!node_modules/zwift-utils",
       "!node_modules/typed-emitter",
       "!node_modules/rxjs",
-      "!node_modules/macos-window-control/{src,obj,test,Makefile,macos-window-control}"
+      "!node_modules/macos-window-control/{src,obj,test,Makefile,macos-window-control}",
+      "!node_modules/napi-build-utils",
+      "!node_modules/prebuild-install",
+      "!node_modules/node-addon-api",
+      "!node_modules/node-abi",
+      "!node_modules/@rgrove/parse-xml/dist/{global.min.js,browser.js}"
     ],
     "electronFuses": {
       "enableEmbeddedAsarIntegrityValidation": true,
@@ -147,8 +154,8 @@
     },
     "linux": {
       "target": "AppImage",
-      "category": "Game"
-    },
-    "afterSign": "build/scripts/notarize.js"
+      "category": "Game",
+      "executableName": "sauce4zwift"
+    }
   }
 }
